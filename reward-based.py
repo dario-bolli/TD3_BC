@@ -456,8 +456,6 @@ def successTrialsReward(subject, preprocessData):
   target_overall = pd.Series(np.concatenate([np.repeat(np.nan, 75), target, np.repeat(np.nan, 25)]))
 
   subject['Angle']['Target'] = target_overall
-
-
   ### Returns preprocessed data with correct success ###
   return(subject)
 
@@ -892,6 +890,9 @@ def resultsMultipleSubjects(pathList, gameType, pocketSide):
                             # Add data to dataframes previously defined
                             dataset[str(initials)]={}
 
+                            dataset[str(initials)]["rewards"] = def_reward(subjData['Game']["Angle"]["Success"], subjData["Game"]["Angle"]["SuccessFunnel"], subjData["Game"]["Angle"]["SuccessMedian"])
+             
+
                             dataset[str(initials)]["cueballpos"] = subjData["PreProcessed"]["cbpos"]
                             
                             dataset[str(initials)]["start_ind"], dataset[str(initials)]["hit_ind"] = start_hit_timesteps(subjData["PreProcessed"])   #, subjData["Game"]["VRData"]["TrialNumber"])
@@ -910,6 +911,9 @@ def resultsMultipleSubjects(pathList, gameType, pocketSide):
                             dataset[str(initials)]["cuedirection"] = subjData["PreProcessed"]["cuedirection"]
 
                             dataset[str(initials)]["cuevel"] = subjData["PreProcessed"]["cuevel"]
+
+                            #dataset[str(initials)]["rewards"] = def_reward(subjData['Game']["Angle"]["Success"], subjData["Game"]["Angle"]["SuccessFunnel"], subjData["Game"]["Angle"]["SuccessMedian"])
+             
                             print("Imported " + initials + " as reward subject " + "for " + pocketSub + " pocket" + " in round: " + path)
                             k+=1
             else:
@@ -956,7 +960,8 @@ def start_hit_timesteps(subjData): #, TrialNumber):
     #trial=0
     hit_ind=[]
     start_ind=[]
-    n = 10
+    n = 1
+    threshold = 0.1
 
     #hit_ind=np.zeros(250)
     #start_ind=np.zeros(250)
@@ -969,28 +974,26 @@ def start_hit_timesteps(subjData): #, TrialNumber):
     block_until_next_trial = True
     #k=0
     for i in range(len(cueballPos)):
-        if i != 0:
+        #The first 200 timesteps approximately are calibration and parasite movements
+        if i > 200:   #!= 0:
             #New trial started
             if cueballPos["trial"].iloc[i] > prev_trial:
                 if miss_hit == True and len(hit_ind) < len(start_ind):   
-                    print("error miss hit: ", cueballPos["trial"].iloc[i], i, len(start_ind), len(hit_ind))
                     hit_ind = np.append(hit_ind, start_ind[-1]+350)#on average hitting cueball after 350 timesteps
                     #hit_ind[k] = start_ind[-1]+350
                     #k+=1
                     miss_hit == False 
                 if static_for_n_timesteps(cueballvel, redballvel, i, n):
                     #Wait for cueball vel y-axis and redball vel y-axis to be zero after new trial started
-                    print("start ind: ", cueballPos["trial"].iloc[i], i, cueballvel["y"].iloc[i], redballvel["y"].iloc[i] )
                     start_ind = np.append(start_ind, i)
                     #start_ind[k] = i
                     prev_trial = cueballPos["trial"].iloc[i]
                     block_until_next_trial = False
                     miss_hit = True
             elif cueballPos["trial"].iloc[i] == prev_trial:
-                if np.linalg.norm(cueballvel[["x", "y", "z"]].iloc[i].to_numpy()) != 0 and block_until_next_trial == False:
+                if np.linalg.norm(cueballvel[["x", "y", "z"]].iloc[i].to_numpy()) > threshold and block_until_next_trial == False:
                 #(cueballPos["x"].iloc[i-1] != cueballPos["x"].iloc[i] or cueballPos["z"].iloc[i-1] != cueballPos["z"].iloc[i]) and cueballPos["trial"].iloc[i] == prev_trial and block_until_next_trial == False:
                     #hit_ind = np.append(hit_ind, i+5)#Add 6 timesteps for margin
-                    print("hit ind", cueballPos["trial"].iloc[i], i)
                     hit_ind = np.append(hit_ind, i+5)
                     #hit_ind[k] = i+5
                     block_until_next_trial = True
@@ -1001,7 +1004,8 @@ def start_hit_timesteps(subjData): #, TrialNumber):
             hit_ind = np.append(hit_ind, start_ind[-1]+350)#on average hitting cueball after 350 timesteps
             #hit_ind[k] = start_ind[-1]+350
 
-    print(len(start_ind), len(hit_ind))
+    if len(start_ind) != 250 or len(hit_ind) != 250:
+        raise ValueError( "Missed an index. start ind size", len(start_ind), "and hit ind size: ", len(hit_ind))
     for i in range(len(start_ind)):
         if start_ind[i] >= hit_ind[i]:
             raise ValueError("start ind > hit_ind", i , start_ind, hit_ind)
@@ -1022,10 +1026,10 @@ def compute_impulseForce(cuevel, cuedirection):
     shotMagnitude = np.linalg.norm(cuevel)
     if shotMagnitude > ubMagnitude:
         shotMagnitude = ubMagnitude
-        print("upper bounded")
+        #print("upper bounded")
     elif shotMagnitude < lbMagnitude:
         shotMagnitude = lbMagnitude
-        print("lower bounded")
+        #print("lower bounded")
 
     for i in range(len(cuevel)):
         '''if i < numVelocitiesAverage:
@@ -1044,24 +1048,17 @@ def compute_impulseForce(cuevel, cuedirection):
 
 #################################### Define Reward #########################################
 
-def def_reward(Success_table, SuccessFunnel_table, SuccessMedian_table):
+def def_reward(SuccessFunnel_table, SuccessMedian_table):
     print("Reward function")
-    reward = np.zeros(len(Success_table))
-    
-    for i in range(len(Success_table)):
-        if Success_table.iloc[i] == 1:
-            reward[i] = 10
-        elif SuccessFunnel_table.iloc[i] == 1:
-            reward[i] = 3
+    reward = np.zeros(len(SuccessFunnel_table))
+    for i in range(len(SuccessFunnel_table)):
+        if SuccessFunnel_table.iloc[i] == 1:
+            reward[i] = 100
         elif SuccessMedian_table.iloc[i] == 1:
-            reward[i] = 1
+            reward[i] = 20
         else:
-            reward[i] = -1
-    print(reward)
-    #Funnel or Median?
-    '''for i in range(len(reward)):
-        if reward[i] != 0 and reward[i] != 10:
-            print(i, reward[i])'''
+            reward[i] = -10
+
     return reward
 
 ############################## Build RL Offline Dataset #########################################
@@ -1166,15 +1163,12 @@ def Offline_RL_dataset(data, terminate_on_end=False):
             action = compute_impulseForce(data["AAB"]["cuevel"][["x", "z"]].iloc[j], data["AAB"]["cuedirection"][["x", "z"]].iloc[j])
             #action[0] = data["AAB"]["cuevel"]["y"].iloc[j]
             
-            
-            rew = def_reward(subjData['Game']["Angle"]["Success"], subjData["Game"]["Angle"]["SuccessFunnel"], subjData["Game"]["Angle"]["SuccessMedian"])
-                            
-            reward = gamma**(data["AAB"]["hit_ind"][i]-j)*data["AAB"]["rewards"][i]
-
             if j== data["AAB"]["hit_ind"][i]:
                 done_bool = True
+                reward = data["AAB"]["rewards"][i]
             else:
                 done_bool = False
+                reward = 0
 
             final_timestep = (episode_step == data["AAB"]["hit_ind"][i]-1)
             if (not terminate_on_end) and final_timestep:
@@ -1376,8 +1370,8 @@ class TD3_BC(object):
 		# Compute critic loss
 		critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
-		if (self.total_it) % 5 == 0:
-			print("iteration ", self.total_it, " critic_loss: ", critic_loss)
+		#if (self.total_it) % 5 == 0:
+			#print("iteration ", self.total_it, " critic_loss: ", critic_loss)
 
 		# Optimize the critic
 		self.critic_optimizer.zero_grad()
@@ -1394,7 +1388,7 @@ class TD3_BC(object):
 
 			actor_loss = -lmbda * Q.mean() + F.mse_loss(pi, action) 
 			
-			print("iteration ", self.total_it, " actor_loss: ", actor_loss)
+			#print("iteration ", self.total_it, " actor_loss: ", actor_loss)
 
 			# Optimize the actor 
 			self.actor_optimizer.zero_grad()
@@ -1428,7 +1422,7 @@ class TD3_BC(object):
 
 
 ################################### CQL_SAC AGENT ##############################################
-'''
+
 def hidden_init(layer):
     fan_in = layer.weight.data.size()[0]
     lim = 1. / np.sqrt(fan_in)
@@ -1980,7 +1974,7 @@ def calculate_huber_loss(td_errors, k=1.0):
     loss = torch.where(td_errors.abs() <= k, 0.5 * td_errors.pow(2), k * (td_errors.abs() - 0.5 * k))
     assert loss.shape == (td_errors.shape[0], 32, 32), "huber loss has wrong shape"
     return loss
-'''
+
 
 ########################################################################################################################################
 #                                                         Training
@@ -2050,36 +2044,34 @@ def train(args, **kwargs):   #config
 		mean,std = 0,1
 	
 	################## Training #######################
-	for t in range(int(args.max_timesteps)):
-		policy.train(replay_buffer, args.batch_size)
+	#for t in range(int(args.max_timesteps)):
+		#policy.train(replay_buffer, args.batch_size)
 
 
-	'''steps = 0
-    average10 = deque(maxlen=10)
-    total_steps = 0
-        collect_random(env=env, dataset=buffer, num_samples=10000)
-        
-        for i in range(1, config.episodes+1):
-            state = env.reset()
-            episode_steps = 0
-            rewards = 0
-            while True:
-                action = agent.get_action(state)
-                steps += 1
-                next_state, reward, done, _ = env.step(action)
-                buffer.add(state, action, reward, next_state, done)
-                policy_loss, alpha_loss, bellmann_error1, bellmann_error2, cql1_loss, cql2_loss, current_alpha, lagrange_alpha_loss, lagrange_alpha = agent.learn(steps, buffer.sample(), gamma=0.99)
-                state = next_state
-                rewards += reward
-                episode_steps += 1
-                if done:
-                    break
-            
+	steps = 0
+    #average10 = deque(maxlen=10)
+	total_steps = 0
+	batch_size = 64 #256
 
-            average10.append(rewards)
-            total_steps += episode_steps
-            print("Episode: {} | Reward: {} | Polciy Loss: {} | Steps: {}".format(i, rewards, policy_loss, steps,))
-    '''
+	for i in range(1, 100):
+		episode_steps = 0
+		rewards = 0
+		while True:
+			steps += 1
+			
+			state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
+			policy_loss, alpha_loss, bellmann_error1, bellmann_error2, cql1_loss, cql2_loss, current_alpha, lagrange_alpha_loss, lagrange_alpha = policy.learn(steps, state, action, reward, next_state, not_done, gamma=0.99)
+			state = next_state
+			rewards += reward
+			episode_steps += 1
+			if not_done == False:
+				break
+
+
+		average10.append(rewards)
+		total_steps += episode_steps
+		print("Episode: {} | Reward: {} | Polciy Loss: {} | Steps: {}".format(i, reward, policy_loss, steps))
+    
 ########################################################################################################################################
 #                                                         Main
 ########################################################################################################################################
@@ -2087,7 +2079,7 @@ def train(args, **kwargs):   #config
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
 	# Experiment
-	parser.add_argument("--policy", default="TD3_BC")               # Policy name
+	parser.add_argument("--policy", default="CQL_SAC") #TD3_BC             # Policy name
 	parser.add_argument("--env", default="hopper-medium-v0")        # OpenAI gym environment name
 	parser.add_argument("--seed", default=0, type=int)              # Sets Gym, PyTorch and Numpy seeds
 	parser.add_argument("--eval_freq", default=5e3, type=int)       # How often (time steps) we evaluate
