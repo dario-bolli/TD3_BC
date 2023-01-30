@@ -643,7 +643,7 @@ def Offline_Reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2)
         action = actions[i][:]
         #reward = rewards[i]
         
-        if data['cueballpos']['trial'].iloc[i+1] != data['cueballpos']['trial'].iloc[i]:
+        if data['cueballpos']['trial'].iloc[i+1] != data['cueballpos']['trial'].iloc[i] or i==N:
             done_bool = True
             reward = rewards.iloc[i]
         else:
@@ -1202,8 +1202,8 @@ def mse_loss(x, error):
 ############################# Define Path and Load Dataset ######################################
 
 def load_dataset():
-    path = "/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 1/"
-    path2 = "/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 2/"
+    path = "C:/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 1/"   #/mnt/c
+    path2 = "C:/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 2/"
     pathlist = [path, path2]
     '''dic for one subject composed of ~1000 timepoints for one shot, 25 shots in one block, and 10 blocks
     First 3 blocks are baseline learning, then 6 blocks of adaptation to perturbation, and one final washout block

@@ -1,23 +1,24 @@
 import numpy as np
+import os
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
+from torch.distributions import Normal
+from torch.nn.utils import clip_grad_norm_
 import copy
+import math
 from tqdm import tqdm
 import pandas as pd
 import matplotlib.pyplot as plt
 #pd.options.mode.chained_assignment = None  # default='warn'
 
 """
-import torch.optim as optim
-from torch.distributions import Normal
-from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
 
 import scipy.stats as ss
 
 import scipy.signal as sci
-import math
 import scipy as sp
 
 import itertools
@@ -32,17 +33,107 @@ import argparse
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ##################################################### Functions ############################################################
+def weighted_sample(dic,prob_dist):
+    ind = np.random.choice(dic['trial'][dic['terminals'] == True],p=prob_dist)
+    return (torch.FloatTensor(dic['states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['actions'][dic['trial'] == ind].to_numpy()).to(device), 
+            torch.FloatTensor(dic['new_states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['rewards'][dic['trial'] == ind].to_numpy()).to(device), 
+            torch.from_numpy(dic['terminals'][dic['trial'] == ind].to_numpy(dtype=bool)).to(device))
 
 def sample(dic):
     ind = np.random.choice(dic['trial'].unique())
     return (torch.FloatTensor(dic['states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['actions'][dic['trial'] == ind].to_numpy()).to(device), 
             torch.FloatTensor(dic['new_states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['rewards'][dic['trial'] == ind].to_numpy()).to(device), 
-            torch.Tensor(dic['terminals'][dic['trial'] == ind].to_numpy()).to(device))
+            torch.from_numpy(dic['terminals'][dic['trial'] == ind].to_numpy(dtype=bool)).to(device))
 
 def get_trajectory(dic, ind):
     return (torch.FloatTensor(dic['states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['actions'][dic['trial'] == ind].to_numpy()).to(device), 
             torch.FloatTensor(dic['new_states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['rewards'][dic['trial'] == ind].to_numpy()).to(device), 
-            torch.Tensor(dic['terminals'][dic['trial'] == ind].to_numpy()).to(device))
+            torch.from_numpy(dic['terminals'][dic['trial'] == ind].to_numpy(dtype=bool)).to(device))
+
+def load_clean_data(filename):
+	print("Loading Data")
+	np.random.seed(0)
+	################### Load Saved dataset ##################
+	# Read Saved dataset
+	
+	df = pd.read_csv(filename[0], header = 0, \
+				names = ['trial','states','actions','new_states','rewards','terminals'], usecols = [1,2,3,4,5,6], lineterminator = "\n")
+	df = df.replace([r'\n', r'\[', r'\]', r'\r'], '', regex=True) 
+
+	states = pd.DataFrame.from_records(np.array(df['states'].str.split(','))).astype(float)
+	actions = pd.DataFrame.from_records(np.array(df['actions'].str.split(','))).astype(float)
+	new_states = pd.DataFrame.from_records(np.array(df['new_states'].str.split(','))).astype(float)
+	trial = df['trial'].astype(int)
+	terminals = df['terminals'].astype(bool)
+	#Train/Test split
+	trial_clean = trial.unique()[26:76]
+	trial_ind = np.arange(0,50)	#select only block 2 and 3 #1,len(trial.unique()) +1 if we want 250 index as well
+	train_trial_ind = np.random.choice(trial_ind, size=int(0.8*len(trial_ind)), replace=False)  #distrib proba for each value, could be useful to weight more "important" trajectories
+	train_trial = trial_clean[train_trial_ind]
+	test_trial = np.delete(trial_clean, train_trial_ind)
+
+	train_ind = trial.isin(train_trial)
+	test_ind = trial.isin(test_trial)
+
+	train_set = {'trial': trial[train_ind]-25,		#to have indexes from 1 to 50 and not 26 to 76 (complex when adding other files)
+					'states': states[train_ind],
+					'actions': actions[train_ind],
+					'new_states': new_states[train_ind],
+					'rewards': df['rewards'][train_ind],
+					'terminals': terminals[train_ind]}
+
+	test_set = {'trial': trial[test_ind]-25,
+					'states': states[test_ind],
+					'actions': actions[test_ind],
+					'new_states': new_states[test_ind],
+					'rewards': df['rewards'][test_ind],
+					'terminals': terminals[test_ind]}
+	
+	#print(filename[0], len(train_set['trial'].unique()), train_set['terminals'].value_counts())
+
+
+	### If multiple files are passed ###
+	if len(filename) > 1:
+		for i, file in enumerate(filename):
+			if i > 0:
+				df = pd.read_csv(file, header = 0, \
+						names = ['trial','states','actions','new_states','rewards','terminals'], usecols = [1,2,3,4,5,6], lineterminator = "\n")
+				df = df.replace([r'\n', r'\[', r'\]', r'\r'], '', regex=True) 
+			
+				states = pd.DataFrame.from_records(np.array(df['states'].str.split(','))).astype(float)
+				actions = pd.DataFrame.from_records(np.array(df['actions'].str.split(','))).astype(float)
+				new_states = pd.DataFrame.from_records(np.array(df['new_states'].str.split(','))).astype(float)
+				trial = df['trial'].astype(int)
+				terminals = df['terminals'].astype(bool)
+				#Train/Test split
+
+				trial_clean = trial.unique()[26:76]
+				trial_ind = np.arange(0,50)	#select only block 2 and 3 #1,len(trial.unique()) +1 if we want 250 index as well
+				train_trial_ind = np.random.choice(trial_ind, size=int(0.8*len(trial_ind)), replace=False)  #distrib proba for each value, could be useful to weight more "important" trajectories
+				train_trial = trial_clean[train_trial_ind]
+				test_trial = np.delete(trial_clean, train_trial_ind)
+
+				train_ind = trial.isin(train_trial)
+				test_ind = trial.isin(test_trial)
+
+				train_set['trial'] = pd.concat([train_set['trial'],trial[train_ind]-25+ (i)*50 ], axis=0)
+				train_set['states'] = pd.concat([train_set['states'], states[train_ind]], axis=0)
+				train_set['actions'] = pd.concat([train_set['actions'], actions[train_ind]], axis=0)
+				train_set['new_states'] = pd.concat([train_set['new_states'], new_states[train_ind]], axis=0)
+				train_set['rewards'] = pd.concat([train_set['rewards'], df['rewards'][train_ind]], axis=0)
+				train_set['terminals'] = pd.concat([train_set['terminals'], terminals[train_ind]], axis=0)	
+
+				test_set['trial'] = pd.concat([test_set['trial'], trial[test_ind]-25+ (i)*50 ], axis=0)
+				test_set['states'] = pd.concat([test_set['states'], states[test_ind]], axis=0)
+				test_set['actions'] = pd.concat([test_set['actions'], actions[test_ind]], axis=0)
+				test_set['new_states'] = pd.concat([test_set['new_states'], new_states[test_ind]], axis=0)
+				test_set['rewards'] = pd.concat([test_set['rewards'], df['rewards'][test_ind]], axis=0)
+				test_set['terminals'] = pd.concat([test_set['terminals'], terminals[test_ind]], axis=0)
+				
+				#print(file,len(train_set['trial'].unique()), train_set['terminals'].value_counts())
+	print("Train set number of trajectories: ", train_set['trial'].unique().shape[0], "Test set number of trajectories: ",test_set['trial'].unique().shape[0])
+	return train_set, test_set
+
 
 def load_data(filename):
 	print("Loading Data")
@@ -52,17 +143,19 @@ def load_data(filename):
 	
 	df = pd.read_csv(filename[0], header = 0, \
 				names = ['trial','states','actions','new_states','rewards','terminals'], usecols = [1,2,3,4,5,6], lineterminator = "\n")
-	df = df.replace([r'\n', r'\[', r'\]'], '', regex=True) 
+	df = df.replace([r'\n', r'\[', r'\]', r'\r'], '', regex=True) 
 
 	states = pd.DataFrame.from_records(np.array(df['states'].str.split(','))).astype(float)
 	actions = pd.DataFrame.from_records(np.array(df['actions'].str.split(','))).astype(float)
 	new_states = pd.DataFrame.from_records(np.array(df['new_states'].str.split(','))).astype(float)
 	trial = df['trial'].astype(int)
+	terminals = df['terminals'].astype(bool)
 
 	#Train/Test split
-	trial_ind = np.arange(1,trial.iloc[-1]+1)
-	train_trial = np.random.choice(trial_ind, size=200, replace=False)  #distrib proba for each value, could be useful to weight more "important" trajectories
-	test_trial = np.delete(trial_ind, train_trial-1)
+	trial_ind = np.arange(0,len(trial.unique()-1))	#+1 if we want 250 index as well
+	train_trial_ind = np.random.choice(trial_ind, size=int(0.8*len(trial_ind)), replace=False)  #distrib proba for each value, could be useful to weight more "important" trajectories
+	train_trial = trial.unique()[train_trial_ind]
+	test_trial = np.delete(trial.unique(), train_trial_ind)
 
 	train_ind = trial.isin(train_trial)
 	test_ind = trial.isin(test_trial)
@@ -72,47 +165,56 @@ def load_data(filename):
 					'actions': actions[train_ind],
 					'new_states': new_states[train_ind],
 					'rewards': df['rewards'][train_ind],
-					'terminals': df['terminals'][train_ind].astype(bool)}
+					'terminals': terminals[train_ind]}
 
 	test_set = {'trial': trial[test_ind],
 					'states': states[test_ind],
 					'actions': actions[test_ind],
 					'new_states': new_states[test_ind],
 					'rewards': df['rewards'][test_ind],
-					'terminals': df['terminals'][test_ind].astype(bool)}
+					'terminals': terminals[test_ind]}
+	
+	#print(filename[0], len(train_set['trial'].unique()), train_set['terminals'].value_counts())
+
+
 	### If multiple files are passed ###
 	if len(filename) > 1:
 		for i, file in enumerate(filename):
 			if i > 0:
 				df = pd.read_csv(file, header = 0, \
 						names = ['trial','states','actions','new_states','rewards','terminals'], usecols = [1,2,3,4,5,6], lineterminator = "\n")
-				df = df.replace([r'\n', r'\[', r'\]'], '', regex=True) 
+				df = df.replace([r'\n', r'\[', r'\]', r'\r'], '', regex=True) 
 			
 				states = pd.DataFrame.from_records(np.array(df['states'].str.split(','))).astype(float)
 				actions = pd.DataFrame.from_records(np.array(df['actions'].str.split(','))).astype(float)
 				new_states = pd.DataFrame.from_records(np.array(df['new_states'].str.split(','))).astype(float)
 				trial = df['trial'].astype(int)
+				terminals = df['terminals'].astype(bool)
 				#Train/Test split
-				trial_ind = np.arange(1,trial.iloc[-1]+1)
-				train_trial = np.random.choice(trial_ind, size=200, replace=False)  #distrib proba for each value, could be useful to weight more "important" trajectories
-				test_trial = np.delete(trial_ind, train_trial-1)
+				trial_ind = np.arange(0,len(trial.unique()-1))	#+1 if we want 250 index as well
+				train_trial_ind = np.random.choice(trial_ind, size=int(0.8*len(trial_ind)), replace=False)  #distrib proba for each value, could be useful to weight more "important" trajectories
+				train_trial = trial.unique()[train_trial_ind]
+				test_trial = np.delete(trial.unique(), train_trial_ind)
 
 				train_ind = trial.isin(train_trial)
 				test_ind = trial.isin(test_trial)
+				
 
 				train_set['trial'] = pd.concat([train_set['trial'],trial[train_ind]+ (i)*250 ], axis=0)
 				train_set['states'] = pd.concat([train_set['states'], states[train_ind]], axis=0)
 				train_set['actions'] = pd.concat([train_set['actions'], actions[train_ind]], axis=0)
 				train_set['new_states'] = pd.concat([train_set['new_states'], new_states[train_ind]], axis=0)
 				train_set['rewards'] = pd.concat([train_set['rewards'], df['rewards'][train_ind]], axis=0)
-				train_set['terminals'] = pd.concat([train_set['terminals'], df['terminals'][train_ind]], axis=0)	
+				train_set['terminals'] = pd.concat([train_set['terminals'], terminals[train_ind]], axis=0)	
 
 				test_set['trial'] = pd.concat([test_set['trial'], trial[test_ind]+ (i)*250 ], axis=0)
 				test_set['states'] = pd.concat([test_set['states'], states[test_ind]], axis=0)
 				test_set['actions'] = pd.concat([test_set['actions'], actions[test_ind]], axis=0)
 				test_set['new_states'] = pd.concat([test_set['new_states'], new_states[test_ind]], axis=0)
 				test_set['rewards'] = pd.concat([test_set['rewards'], df['rewards'][test_ind]], axis=0)
-				test_set['terminals'] = pd.concat([test_set['terminals'], df['terminals'][test_ind]], axis=0)
+				test_set['terminals'] = pd.concat([test_set['terminals'], terminals[test_ind]], axis=0)
+				
+				#print(file,len(train_set['trial'].unique()), train_set['terminals'].value_counts())
 	print("Train set number of trajectories: ", train_set['trial'].unique().shape[0], "Test set number of trajectories: ",test_set['trial'].unique().shape[0])
 	return train_set, test_set
 ################################################## TD3 Agent ##################################################################
@@ -120,7 +222,6 @@ def load_data(filename):
 class Actor(nn.Module):
 	def __init__(self, state_dim, action_dim, max_action):
 		super(Actor, self).__init__()
-
 		self.l1 = nn.Linear(state_dim, 256)
 		self.l2 = nn.Linear(256, 256)	#nn.Linear(256, 512)
 		self.l3 = nn.Linear(256, action_dim)	#nn.Linear(512, 256)
@@ -139,7 +240,6 @@ class Actor(nn.Module):
 class Critic(nn.Module):
 	def __init__(self, state_dim, action_dim):
 		super(Critic, self).__init__()
-
 		# Q1 architecture
 		self.l1 = nn.Linear(state_dim + action_dim, 256)
 		self.l2 = nn.Linear(256,256)	#nn.Linear(256, 512)
@@ -154,6 +254,7 @@ class Critic(nn.Module):
 
 
 	def forward(self, state, action):
+		
 		sa = torch.cat([state, action], 1)
 
 		q1 = F.relu(self.l1(sa))
@@ -216,12 +317,13 @@ class TD3_BC(object):
 		return self.actor(state)	#.cpu().data.numpy().flatten()
 
 
-	def train(self, trajectory, batch_size=4):
+	def train(self, trajectory, batch_size=1):
 		self.total_it += 1
 		a_loss = 0.0
 		c_loss = 0.0
 		# Sample replay buffer 
-		states, actions, new_states, rewards, not_done = trajectory
+		states, actions, new_states, rewards, terminals = trajectory
+        #not_done = np.invert(terminals)
 		N_updates = states.size(dim=0)/batch_size
 		for i in range(0, states.size(dim=0), batch_size):
 			with torch.no_grad():
@@ -237,7 +339,8 @@ class TD3_BC(object):
 				# Compute the target Q value
 				target_Q1, target_Q2 = self.critic_target(new_states[i:i+batch_size][:], next_action)
 				target_Q = torch.min(target_Q1, target_Q2)
-				target_Q = rewards[i] + not_done[i] * self.discount * target_Q
+				#print("return Q estimate: ",i, target_Q)
+				target_Q = rewards[i] + (not terminals[i]) * self.discount * target_Q
 
 			# Get current Q estimates
 			#print(states[i:i+batch_size][:].shape, actions[i:i+batch_size][:].shape)
@@ -254,15 +357,15 @@ class TD3_BC(object):
 			critic_loss.backward()
 			self.critic_optimizer.step()
 
-		# Delayed policy updates
-			if self.total_it % self.policy_freq == 0:
+			# Delayed policy updates
+			if i % self.policy_freq == 0:   #self.total_it
 
 				# Compute actor loss
 				pi = self.actor(states[i:i+batch_size][:])
 				Q = self.critic.Q1(states[i:i+batch_size][:], pi)
 				lmbda = self.alpha/Q.abs().mean().detach()
 
-				actor_loss = -lmbda * Q.mean() + F.mse_loss(pi, actions[i:i+batch_size][:])
+				actor_loss = -lmbda * Q.mean() #+ F.mse_loss(pi, actions[i:i+batch_size][:])
 				# Optimize the actor 
 				self.actor_optimizer.zero_grad()
 				actor_loss.backward()
@@ -279,7 +382,7 @@ class TD3_BC(object):
 		return c_loss/N_updates, a_loss/N_updates
 
 	def save(self, filename):
-		torch.save(self.critic.state_dict(), filename + "_critic")
+		torch.save(self.critic.state_dict(), filename + "_critic")	# "_clean" +
 		torch.save(self.critic_optimizer.state_dict(), filename + "_critic_optimizer")
 		
 		torch.save(self.actor.state_dict(), filename + "_actor")
@@ -297,13 +400,12 @@ class TD3_BC(object):
 
 ################################################## CQL Agent ###############################################################
 
-'''
 def hidden_init(layer):
     fan_in = layer.weight.data.size()[0]
     lim = 1. / np.sqrt(fan_in)
     return (-lim, lim)
 
-class Actor(nn.Module):
+class Actor_CQL(nn.Module):
     """Actor (Policy) Model."""
 
     def __init__(self, state_size, action_size, hidden_size=256, init_w=3e-3, log_std_min=-20, log_std_max=2):
@@ -316,10 +418,9 @@ class Actor(nn.Module):
             fc1_units (int): Number of nodes in first hidden layer
             fc2_units (int): Number of nodes in second hidden layer
         """
-        super(Actor, self).__init__()
+        super(Actor_CQL, self).__init__()
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
-        
         self.fc1 = nn.Linear(state_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
 
@@ -327,7 +428,6 @@ class Actor(nn.Module):
         self.log_std_linear = nn.Linear(hidden_size, action_size)
 
     def forward(self, state):
-
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
         mu = self.mu(x)
@@ -604,14 +704,12 @@ class DeepIQN(nn.Module):
         return actions  
 
 
-
 class CQLSAC(nn.Module):
     """Interacts with and learns from the environment."""
     
     def __init__(self,
                         state_size,
-                        action_size,
-                        device
+                        action_size
                 ):
         """Initialize an Agent object.
         
@@ -624,7 +722,8 @@ class CQLSAC(nn.Module):
         super(CQLSAC, self).__init__()
         self.state_size = state_size
         self.action_size = action_size
-
+	
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
         
         self.gamma = 0.99
@@ -649,20 +748,20 @@ class CQLSAC(nn.Module):
         
         # Actor Network 
 
-        self.actor_local = Actor(state_size, action_size, hidden_size).to(device)
+        self.actor_local = Actor_CQL(state_size, action_size, hidden_size).to(device)
         self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=learning_rate)     
         
         # Critic Network (w/ Target Network)
 
-        self.critic1 = IQN(state_size, action_size, hidden_size, seed=1).to(device)
-        self.critic2 = IQN(state_size, action_size, hidden_size, seed=2).to(device)
+        self.critic1 = IQN(state_size, action_size, hidden_size, seed=1, device = self.device).to(device)
+        self.critic2 = IQN(state_size, action_size, hidden_size, seed=2, device = self.device).to(device)
         
         assert self.critic1.parameters() != self.critic2.parameters()
         
-        self.critic1_target = IQN(state_size, action_size, hidden_size).to(device)
+        self.critic1_target = IQN(state_size, action_size, hidden_size, device = self.device).to(device)
         self.critic1_target.load_state_dict(self.critic1.state_dict())
 
-        self.critic2_target = IQN(state_size, action_size, hidden_size).to(device)
+        self.critic2_target = IQN(state_size, action_size, hidden_size, device = self.device).to(device)
         self.critic2_target.load_state_dict(self.critic2.state_dict())
 
         self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=learning_rate)
@@ -702,7 +801,7 @@ class CQLSAC(nn.Module):
         random_log_prstate = math.log(0.5 ** self.action_size)
         return random_values - random_log_prstate
     
-    def train(self, step, experiences, gamma, d=1):
+    def train(self, experiences):	#step, gamma, d=1
         """Updates actor, critics and entropy_alpha parameters using given batch of experience tuples.
         Q_targets = r + γ * (min_critic_target(next_state, actor_target(next_state)) - α *log_pi(next_action|next_state))
         Critic_loss = MSE(Q, Q_target)
@@ -715,7 +814,7 @@ class CQLSAC(nn.Module):
             experiences (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples 
             gamma (float): discount factor
         """
-        states, actions, rewards, next_states, dones = experiences
+        states, actions, next_states, rewards, dones = experiences
 
         # ---------------------------- update actor ---------------------------- #
         current_alpha = copy.deepcopy(self.alpha)
@@ -734,6 +833,7 @@ class CQLSAC(nn.Module):
         # ---------------------------- update critic ---------------------------- #
         # Get predicted next-state actions and Q values from target models
         with torch.no_grad():
+            print("next_states shape: ", next_states.size())
             next_action, _ = self.actor_local.evaluate(next_states)
             #next_action = next_action.unsqueeze(1).repeat(1, 10, 1).view(next_action.shape[0] * 10, next_action.shape[1])
             #temp_next_states = next_states.unsqueeze(1).repeat(1, 10, 1).view(next_states.shape[0] * 10, next_states.shape[1])
@@ -744,7 +844,7 @@ class CQLSAC(nn.Module):
             Q_target_next = torch.min(Q_target1_next, Q_target2_next).transpose(1,2)
 
             # Compute Q targets for current states (y_i)
-            Q_targets = rewards.cpu().unsqueeze(-1) + (gamma * (1 - dones.cpu().unsqueeze(-1)) * Q_target_next.cpu()) 
+            Q_targets = rewards.cpu().unsqueeze(-1) + (self.gamma * (1 - dones.cpu().unsqueeze(-1)) * Q_target_next.cpu()) 
 
 
         # Compute critic loss
@@ -850,9 +950,9 @@ def calculate_huber_loss(td_errors, k=1.0):
     assert loss.shape == (td_errors.shape[0], 32, 32), "huber loss has wrong shape"
     return loss
 
-'''
+
 ######################### Train ####################################
-def train(dataset, state_dim=24, action_dim=2, epochs=3000, train=True):  
+def train(dataset, state_dim=24, action_dim=2, epochs=3000, train=True, model = "TD3_BC"):  
 	print("start Training")
 	# Environment State Properties
 	max_action = 1
@@ -897,82 +997,276 @@ def train(dataset, state_dim=24, action_dim=2, epochs=3000, train=True):
 		# TD3 + BC
 		"alpha": args['alpha']
 	    }
-    
-	# Initialize Agent
-	policy = TD3_BC(**kwargs) 
-	## Load trained model ##
-	print("---------------------------------------")
-	print(f"Policy: {args['policy']}")	#, Seed: {args['seed']}")
-	print("---------------------------------------")
-	if train == True:
-		batch_size = 256
-		a_losses = []
-		c_losses = []
-		
-		'''for trial in tqdm(dataset['trial'].unique()):
-			trajectory = get_trajectory(dataset, trial)
-			c_loss, a_loss = policy.train(trajectory, batch_size)	#, args, **kwargs
-			if a_loss != 0.0:	#actor loss updated only once every "policy_freq" update, set to 0 otherwise
-				a_losses.append(a_loss)
-			c_losses.append(c_loss)
-		'''
-		for i in tqdm(range(1, epochs)):
-			trajectory = sample(dataset)
-			c_loss, a_loss = policy.train(trajectory, batch_size)	#, args, **kwargs
-			if a_loss != 0.0:	#actor loss updated only once every "policy_freq" update, set to 0 otherwise
-				a_losses.append(a_loss)
-			c_losses.append(c_loss)
-			
-			if i%10 == 0:
-				policy.save("models/TD3_BC_policy")
-		_, actor_loss_curve = plt.subplots()
-		actor_loss_curve.plot(a_losses)
-		plt.savefig('training_plots/actor_losses_training_curve.png')
 
-		_, critic_loss_curve = plt.subplots()
-		critic_loss_curve.plot(c_losses)
-		plt.savefig('training_plots/critic_losses_training_curve.png')
-	else:
-		print("load trained model")
-		policy.load("models/TD3_BC_policy")
+	if model == "CQL_SAC":
+		# Initialize Agent
+		policy = CQLSAC(state_dim,action_dim)
+		print("---------------------------------------")
+		print(f"Policy: {args['policy']}")
+		print("---------------------------------------")
+		if train == True:
+			batch_size = 256
+			alpha_losses = []
+			critic1_losses = []
+			critic2_losses = []
+			policy_losses = []
+
+			for i in tqdm(range(1, epochs)):
+				trajectory = sample(dataset)	#weighted_sample(dataset, prob_dist)
+				#trajectory = sample(dataset)
+				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss,\
+				cql2_scaled_loss, current_alpha, cql_alpha_loss, cql_alpha = policy.train(trajectory)
+				alpha_losses.append(alpha_loss)
+				critic1_losses.append(critic1_loss + cql1_scaled_loss)
+				critic2_losses.append(critic2_loss + cql2_scaled_loss)
+				policy_losses.append(actor_loss)
+				
+				#if i%10 == 0:
+					#policy.save("models/CQL_SAC_policy")
+			_, alpha_loss_curve = plt.subplots()
+			alpha_loss_curve.plot(alpha_losses)
+			plt.savefig('training_plots/CQL_SAC/alpha_losses_training_curve.png')
+
+			_, critic1_loss_curve = plt.subplots()
+			critic1_loss_curve.plot(critic1_losses)
+			plt.savefig('training_plots/CQL_SAC/critic1_losses_training_curve.png')
+
+			_, critic2_loss_curve = plt.subplots()
+			critic2_loss_curve.plot(alpha_losses)
+			plt.savefig('training_plots/CQL_SAC/critic2_losses_training_curve.png')
+
+			_, policy_loss_curve = plt.subplots()
+			policy_loss_curve.plot(policy_losses)
+			plt.savefig('training_plots/CQL_SAC/policy_losses_training_curve.png')
 	
+	elif model == "TD3_BC":
+		# Initialize Agent
+		policy = TD3_BC(**kwargs) 
+		print("---------------------------------------")
+		print(f"Policy: {args['policy']}")	#, Seed: {args['seed']}")
+		print("---------------------------------------")
+		if train == True:
+			batch_size = 256
+			a_losses = []
+			c_losses = []
+
+			
+			trajectory_rewards = dataset['rewards'][dataset['terminals']==True]
+			prob_dist = np.ones(len(trajectory_rewards))	#len(dataset['trial'].unique())-10)#-1 Because last trial has no terminal state (to be changed in future)
+
+			prob_dist[trajectory_rewards != -10.0] = 50	#50 times higher probs than other traj to be sampled
+			prob_dist = prob_dist/prob_dist.sum()
+			
+			for i in tqdm(range(1, epochs)):
+				trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset)    
+
+				#trajectory = sample(dataset)
+				c_loss, a_loss = policy.train(trajectory)   #, batch_size)	#, args, **kwargs
+				if a_loss != 0.0:	#actor loss updated only once every "policy_freq" update, set to 0 otherwise
+					a_losses.append(a_loss)
+				c_losses.append(c_loss)
+				
+				if i%10 == 0:
+					policy.save("models/TD3_BC_policy")
+			_, actor_loss_curve = plt.subplots()
+			actor_loss_curve.plot(a_losses)
+			plt.savefig('training_plots/actor_losses_training_curve.png')
+
+			_, critic_loss_curve = plt.subplots()
+			critic_loss_curve.plot(c_losses)
+			plt.savefig('training_plots/critic_losses_training_curve.png')
+		else:
+			print("load trained model")
+			policy.load("models/TD3_BC_policy")
+	else:
+		print(model, "is not implemented")
+		policy=None
 	return policy
 ######################### Evaluation ####################################
 def evaluate(dataset, policy):
 	print("start Evaluation")
 	losses = []
 	avg_loss = 0.0
+
+	## Actions Visualisation
+	behaviour_actions_ = []
+	agent_actions_ = []
+	behaviour_actions_u_ = []
+	agent_actions_u_ = []
+	count_successful_trajectory = 0
+	count_unsuccessful_trajectory = 0
+	print("len dataset: ", len(dataset['trial'].unique()))
+
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
 		epoch_loss = 0.0
-		states, actions, _,_,_ = get_trajectory(dataset, trial)	#new_states, rewards, not_done
+		#states, actions, new_states, reward, terminals= sample(dataset)
+		#print("not terminals: ", terminals)
+		states, actions, new_states, reward, terminals= get_trajectory(dataset, trial)
+		
+		if torch.any(terminals) == True:
+			if reward[terminals] != -10.0:
+				## Actions Visualisation
+				behaviour_actions = np.zeros(states.size(dim=0))
+				agent_actions = np.zeros(states.size(dim=0))
+				## Actions Visualisation
 
-		for j in range(states.size(dim=0)):
+				for k in range(states.size(dim=0)):
+					#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
+					pi_e = policy.select_action(states[k][:])
+					pi_b = actions[k][:]
+					#print("step ", k, pi_e, pi_b)
+					epoch_loss += F.mse_loss(pi_e, pi_b)
 
-			#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-			pi_e = policy.select_action(states[j][:])
-			pi_b = actions[j][:]
-			epoch_loss += F.mse_loss(pi_e, pi_b)
-			#MSE on final result of a trajectory?
-			#if j==states.size(dim=0)-1:
-				#print(pi_e, pi_b)
-		epoch_loss = epoch_loss/states.size(dim=0)
-		losses.append(epoch_loss.detach().numpy())
-		#print("Loss for trajectory ", i, " (trial number: ", trial, ") = ", loss)
+					## Actions Visualisation
+					behaviour_actions[k] = pi_b.detach().numpy()[1]
+					agent_actions[k] = pi_e.detach().numpy()[1]
+				behaviour_actions_ = np.append(behaviour_actions_, behaviour_actions)
+				agent_actions_ = np.append(agent_actions_, agent_actions)
+				count_successful_trajectory += 1
+				## Actions Visualisation
 
-	_, evaluation_loss_curve = plt.subplots()
+
+				epoch_loss = epoch_loss/states.size(dim=0)
+				losses.append(epoch_loss.detach().numpy())
+
+			## Actions Visualisation
+			elif reward[terminals] == -10.0:
+				#print("terminal rewrds: ", j*trial, reward[terminals])
+				behaviour_actions_u = np.zeros(states.size(dim=0))
+				agent_actions_u = np.zeros(states.size(dim=0))
+				for k in range(states.size(dim=0)):
+
+					#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
+					pi_e = policy.select_action(states[k][:])
+					pi_b = actions[k][:]
+
+					behaviour_actions_u[k] = pi_b.detach().numpy()[1]
+					agent_actions_u[k] = pi_e.detach().numpy()[1]
+				behaviour_actions_u_ = np.append(behaviour_actions_u_, behaviour_actions_u)
+				agent_actions_u_ = np.append(agent_actions_u_, agent_actions_u)
+				count_unsuccessful_trajectory += 1
+		else:
+			print("No terminal state in trial ", trial, terminals)
+		## Actions Visualisation
+
+	print("count_unsuccessful_trajectory: ", count_unsuccessful_trajectory, "count_successful_trajectory: ", count_successful_trajectory)
+	## Actions Visualisation
+	behaviour_actions_graph = np.zeros((count_successful_trajectory, 50))    
+	agent_actions_graph = np.zeros((count_successful_trajectory, 50))   
+	
+	for i in range(count_successful_trajectory):
+		behaviour_actions_graph[i][:] = behaviour_actions_[i*50:(i+1)*50]   
+		agent_actions_graph[i][:] = agent_actions_[i*50:(i+1)*50] 
+	behaviour_actions_mean = np.mean(behaviour_actions_graph, axis=0)
+	behaviour_actions_std = np.std(behaviour_actions_graph, axis=0)
+	agent_actions_mean = np.mean(agent_actions_graph , axis=0)
+	agent_actions_std = np.std(agent_actions_graph , axis=0)
+
+	behaviour_actions_graph_u = np.zeros((count_unsuccessful_trajectory, 50))   
+	agent_actions_graph_u = np.zeros((count_unsuccessful_trajectory, 50)) 
+	
+	for i in range(count_unsuccessful_trajectory):
+		behaviour_actions_graph_u[i][:] = behaviour_actions_u_[i*50:(i+1)*50]
+		agent_actions_graph_u[i][:] = agent_actions_u_[i*50:(i+1)*50]
+	behaviour_actions_mean_u = np.mean(behaviour_actions_graph_u, axis=0)
+	behaviour_actions_std_u = np.std(behaviour_actions_graph_u, axis=0)
+	agent_actions_mean_u = np.mean(agent_actions_graph_u , axis=0)
+	agent_actions_std_u = np.std(agent_actions_graph_u , axis=0)
+	print("Agent size ", agent_actions_mean_u.shape)
+
+	fig, mean_b = plt.subplots()
+	mean_b.set_xlabel("timesteps")
+	mean_b.set_ylabel("Impulse force")
+	fig.suptitle('Behaviour and Agent policy on Successful trial', fontsize=16, y=1.04)
+	X = np.arange(1, 50+1)   
+	mean_b.errorbar(X, agent_actions_mean, agent_actions_std, color='blue', ecolor = 'red')#, linestyle='None', marker='^')
+	mean_b.plot(X, behaviour_actions_mean, color='green')
+	fig.savefig('training_plots/Successful_behaviour_agent.png')
+	
+	fig1, mean_b_1 = plt.subplots()
+	mean_b_1.set_xlabel("timesteps")
+	mean_b_1.set_ylabel("Impulse force")
+	fig1.suptitle('Behaviour and Agent policy on Unsuccessful trial', fontsize=16, y=1.04)
+	X = np.arange(1, 50+1)
+	mean_b_1.errorbar(X, agent_actions_mean_u, agent_actions_std_u, color='blue', ecolor = 'red')#, linestyle='None', marker='^')
+	mean_b_1.plot(X, behaviour_actions_mean_u, color='green')
+	fig1.savefig('training_plots/Unsuccessful_behaviour_agent.png')
+	## Actions Visualisation
+
+	ev_fig, evaluation_loss_curve = plt.subplots()
 	evaluation_loss_curve.plot(losses)
-	plt.savefig('training_plots/evaluation_losses.png')
+	ev_fig.savefig('training_plots/evaluation_losses.png')
 	avg_loss = sum(losses)/len(losses)
 	print("Average Evaluation loss: ", avg_loss)
 
+def plot_animated_learnt_policy(dataset, policy):
+	import matplotlib.animation as animation
+
+	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[0])
+	states = states.detach().numpy()
+	#cueposfront = policy.select_action(states).detach().numpy()
+
+	fig, ax = plt.subplots(1,1)
+	#fig.set_size_inches(10,10)
+	#fig.tight_layout()	#rect=[0, 0.03, 1, 0.95])
+	#line, = ax.plot(cpos_x[0], cpos_z[0])
+	
+	#ax = plt.axes(xlim=(-2, 2), ylim=(-2, 2))
+	#line, = ax.plot([], [], lw=3)	# ms=10, color="red")
+
+	"""def init():
+		line.set_data([], [])
+		return line,"""
+
+	def animate(i):
+		ax.clear()
+		#cueposfront = policy.select_action(states)
+		#line.set_xdata(cueposfront[i,0].detach().numpy())
+		#line.set_ydata(cueposfront[i,1].detach().numpy())  # update the data.
+		#line.set_data(cueposfront[i,0].detach().numpy()+i/10, cueposfront[i,1].detach().numpy()+i/10)
+		x_values = [states[i,11], states[i,9]]
+		z_values = [states[i,12], states[i,10]]
+		#line.set_data(x_values, z_values)
+		ax.plot(x_values, z_values, color="blue")
+
+		x_val = states[i,0]
+		z_val = states[i,1]
+		#point.set_data(x_values, z_values)
+		ax.plot(x_val, z_val, ms=7, color='black', marker='o')
+		
+		
+		ax.plot(states[0][4], states[0][5], ms=7, color="red", marker='o')
+		ax.plot(states[0][6], states[0][7], ms=12, color='green', marker='o')
+		ax.set(xlim=(-2, 2), ylim=(-2, 2))
+		#return line, point,
+
+
+	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=20, repeat=False)	#init_func=init, blit=True
+	plt.close()
+	#from matplotlib.animation import PillowWriter
+	anim.save('training_plots/Agent_policy3.gif', writer='imagemagick')	#dpi=300, writer=PillowWriter(fps=1))	#imagemagick
+	print("saved GIF")
 ########################## Main  ########################################
 
 if __name__ == "__main__":
-	filename = ["RL_dataset/Offline_reduced/AS_Offline_reduced.csv"]	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv",
-	 #"RL_dataset/Offline_reduced/AE_Offline_reduced.csv", "RL_dataset/Offline_reduced/AK_Offline_reduced.csv",
-	 #"RL_dataset/Offline_reduced/AS_Offline_reduced.csv"]	#"RL_dataset/Offline_reduced/AAB_Offline_reduced.csv" #"RL_dataset/AAB.csv"
-	train_set, test_set = load_data(filename)
+	#filename = []
+	#path = "/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/TD3_BC/RL_dataset/Offline_reduced/"
+    #for file in sorted(os.listdir(path)):
+		#filename.append(path+file)
+
+	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
+    #"RL_dataset/Offline_reduced/JW_Offline_reduced.csv", "RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
+    #"RL_dataset/Offline_reduced/GS_Offline_reduced.csv", "RL_dataset/Offline_reduced/CX_Offline_reduced.csv", "RL_dataset/Offline_reduced/CP_Offline_reduced.csv",
+    #"RL_dataset/Offline_reduced/KO_Offline_reduced.csv"]
+    #"RL_dataset/Offline_reduced/AS_Offline_reduced.csv"
+	
+
+    filename = ["RL_dataset/AAB.csv"]	#Offline_reduced/AAB_Offline_reduced.csv"]
+	#train_set, test_set = load_data(filename)
+    train_set, test_set = load_clean_data(filename)
 	#state_dim=24, action_dim=2  
 	#state dim must be multiple of 6
-	policy = train(train_set,state_dim=14, action_dim=2, epochs=30000, train=True)	#set train=False to load pretrained model
-	evaluate(test_set, policy)
+    policy = train(train_set,state_dim=14, action_dim=2, epochs=5000, train=False, model="TD3_BC")	#CQL_SAC #set train=False to load pretrained model
+
+    #evaluate(train_set, policy)
+    plot_animated_learnt_policy(test_set, policy)
