@@ -11,6 +11,7 @@ import math
 from tqdm import tqdm
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 #pd.options.mode.chained_assignment = None  # default='warn'
 
 """
@@ -53,10 +54,6 @@ def compute_reward_evaluation(cuevel, target_corner, reward):
     lbPocket = mean_pocket - 0.3106383 #= 104.7629617
     ubPocket = mean_pocket + 0.2543617 #= 105.3279617
 
-    if angle <= ubPocket and angle >= lbPocket:     #Mathf.Max(currentTargetAngle, 
-        reward = 100
-        print("Funnel")
-    '''
     if reward == 100:
         reward = 100
     else:
@@ -65,7 +62,7 @@ def compute_reward_evaluation(cuevel, target_corner, reward):
             print("Funnel")
         else:
             reward = 0
-    return reward'''
+    return reward
 
 
 def weighted_sample(dic,prob_dist):
@@ -275,8 +272,8 @@ class Actor(nn.Module):
 		self.l2 = nn.Linear(256, 256)	#nn.Linear(256, 512)
 		self.l3 = nn.Linear(256, action_dim)	#nn.Linear(512, 256)
 		#self.l4 = nn.Linear(256, action_dim)
-		self.actions_upper_bound = torch.tensor([135,3,3])
-		self.actions_lower_bound = torch.tensor([45,-3,-3])
+		self.actions_upper_bound = torch.tensor([135,1,1])
+		self.actions_lower_bound = torch.tensor([45,-1,-1])
 		self.max_action = max_action
 		
 
@@ -448,6 +445,500 @@ class TD3_BC(object):
 
 ################################################## CQL Agent ###############################################################
 
+
+'''
+from collections import OrderedDict
+from copy import deepcopy
+
+from ml_collections import ConfigDict
+
+import numpy as np
+import torch
+import torch.optim as optim
+from torch import nn as nn
+import torch.nn.functional as F
+
+from .utils import prefix_metrics
+
+########## Utility Functions ############
+class FullyConnectedNetwork(nn.Module):
+
+    def __init__(self, input_dim, output_dim, arch='256-256', orthogonal_init=False):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.arch = arch
+        self.orthogonal_init = orthogonal_init
+
+        d = input_dim
+        modules = []
+        hidden_sizes = [int(h) for h in arch.split('-')]
+
+        for hidden_size in hidden_sizes:
+            fc = nn.Linear(d, hidden_size)
+            if orthogonal_init:
+                nn.init.orthogonal_(fc.weight, gain=np.sqrt(2))
+                nn.init.constant_(fc.bias, 0.0)
+            modules.append(fc)
+            modules.append(nn.ReLU())
+            d = hidden_size
+
+        last_fc = nn.Linear(d, output_dim)
+        if orthogonal_init:
+            nn.init.orthogonal_(last_fc.weight, gain=1e-2)
+        else:
+            nn.init.xavier_uniform_(last_fc.weight, gain=1e-2)
+
+        nn.init.constant_(last_fc.bias, 0.0)
+        modules.append(last_fc)
+
+        self.network = nn.Sequential(*modules)
+
+    def forward(self, input_tensor):
+        return self.network(input_tensor)
+
+class TanhGaussianPolicy(nn.Module):
+
+    def __init__(self, observation_dim, action_dim, arch='256-256',
+                 log_std_multiplier=1.0, log_std_offset=-1.0,
+                 orthogonal_init=False, no_tanh=False):
+        super().__init__()
+        self.observation_dim = observation_dim
+        self.action_dim = action_dim
+        self.arch = arch
+        self.orthogonal_init = orthogonal_init
+        self.no_tanh = no_tanh
+
+        self.base_network = FullyConnectedNetwork(
+            observation_dim, 2 * action_dim, arch, orthogonal_init
+        )
+        self.log_std_multiplier = Scalar(log_std_multiplier)
+        self.log_std_offset = Scalar(log_std_offset)
+        self.tanh_gaussian = ReparameterizedTanhGaussian(no_tanh=no_tanh)
+
+    def log_prob(self, observations, actions):
+        if actions.ndim == 3:
+            observations = extend_and_repeat(observations, 1, actions.shape[1])
+        base_network_output = self.base_network(observations)
+        mean, log_std = torch.split(base_network_output, self.action_dim, dim=-1)
+        log_std = self.log_std_multiplier() * log_std + self.log_std_offset()
+        return self.tanh_gaussian.log_prob(mean, log_std, actions)
+
+    def forward(self, observations, deterministic=False, repeat=None):
+        if repeat is not None:
+            observations = extend_and_repeat(observations, 1, repeat)
+        base_network_output = self.base_network(observations)
+        mean, log_std = torch.split(base_network_output, self.action_dim, dim=-1)
+        log_std = self.log_std_multiplier() * log_std + self.log_std_offset()
+        return self.tanh_gaussian(mean, log_std, deterministic)
+
+
+class SamplerPolicy(object):
+
+    def __init__(self, policy, device):
+        self.policy = policy
+        self.device = device
+
+    def __call__(self, observations, deterministic=False):
+        with torch.no_grad():
+            observations = torch.tensor(
+                observations, dtype=torch.float32, device=self.device
+            )
+            actions, _ = self.policy(observations, deterministic)
+            actions = actions.cpu().numpy()
+        return actions
+
+
+class FullyConnectedQFunction(nn.Module):
+
+    def __init__(self, observation_dim, action_dim, arch='256-256', orthogonal_init=False):
+        super().__init__()
+        self.observation_dim = observation_dim
+        self.action_dim = action_dim
+        self.arch = arch
+        self.orthogonal_init = orthogonal_init
+        self.network = FullyConnectedNetwork(
+            observation_dim + action_dim, 1, arch, orthogonal_init
+        )
+
+    @multiple_action_q_function
+    def forward(self, observations, actions):
+        input_tensor = torch.cat([observations, actions], dim=-1)
+        return torch.squeeze(self.network(input_tensor), dim=-1)
+
+
+def soft_target_update(network, target_network, soft_target_update_rate):
+    target_network_params = {k: v for k, v in target_network.named_parameters()}
+    for k, v in network.named_parameters():
+        target_network_params[k].data = (
+            (1 - soft_target_update_rate) * target_network_params[k].data
+            + soft_target_update_rate * v.data
+        )
+
+
+class Scalar(nn.Module):
+    def __init__(self, init_value):
+        super().__init__()
+        self.constant = nn.Parameter(
+            torch.tensor(init_value, dtype=torch.float32)
+        )
+
+    def forward(self):
+        return self.constant
+
+
+def prefix_metrics(metrics, prefix):
+    return {
+        '{}/{}'.format(prefix, key): value for key, value in metrics.items()
+    }
+################## CQL class Definition ########################
+class ConservativeSAC(object):
+
+    @staticmethod
+    def get_default_config(updates=None):
+        config = ConfigDict()
+        config.discount = 0.99
+        config.alpha_multiplier = 1.0
+        config.use_automatic_entropy_tuning = True
+        config.backup_entropy = False
+        config.target_entropy = 0.0
+        config.policy_lr = 3e-4
+        config.qf_lr = 3e-4
+        config.optimizer_type = 'adam'
+        config.soft_target_update_rate = 5e-3
+        config.target_update_period = 1
+        config.use_cql = True
+        config.cql_n_actions = 10
+        config.cql_importance_sample = True
+        config.cql_lagrange = False
+        config.cql_target_action_gap = 1.0
+        config.cql_temp = 1.0
+        config.cql_min_q_weight = 5.0
+        config.cql_max_target_backup = False
+        config.cql_clip_diff_min = -np.inf
+        config.cql_clip_diff_max = np.inf
+
+        if updates is not None:
+            config.update(ConfigDict(updates).copy_and_resolve_references())
+        return config
+
+    def __init__(self, config, policy, qf1, qf2, target_qf1, target_qf2):
+        self.config = ConservativeSAC.get_default_config(config)
+        self.policy = policy
+        self.qf1 = qf1
+        self.qf2 = qf2
+        self.target_qf1 = target_qf1
+        self.target_qf2 = target_qf2
+
+        optimizer_class = {
+            'adam': torch.optim.Adam,
+            'sgd': torch.optim.SGD,
+        }[self.config.optimizer_type]
+
+        self.policy_optimizer = optimizer_class(
+            self.policy.parameters(), self.config.policy_lr,
+        )
+        self.qf_optimizer = optimizer_class(
+            list(self.qf1.parameters()) + list(self.qf2.parameters()), self.config.qf_lr
+        )
+
+        if self.config.use_automatic_entropy_tuning:
+            self.log_alpha = Scalar(0.0)
+            self.alpha_optimizer = optimizer_class(
+                self.log_alpha.parameters(),
+                lr=self.config.policy_lr,
+            )
+        else:
+            self.log_alpha = None
+
+        if self.config.cql_lagrange:
+            self.log_alpha_prime = Scalar(1.0)
+            self.alpha_prime_optimizer = optimizer_class(
+                self.log_alpha_prime.parameters(),
+                lr=self.config.qf_lr,
+            )
+
+        self.update_target_network(1.0)
+        self._total_steps = 0
+
+    def update_target_network(self, soft_target_update_rate):
+        soft_target_update(self.qf1, self.target_qf1, soft_target_update_rate)
+        soft_target_update(self.qf2, self.target_qf2, soft_target_update_rate)
+
+    def train(self, batch, bc=False):
+        self._total_steps += 1
+
+        observations = batch['states']
+        actions = batch['actions']
+        rewards = batch['rewards']
+        next_observations = batch['new_states']
+        dones = batch['terminals']
+
+        new_actions, log_pi = self.policy(observations)
+
+        if self.config.use_automatic_entropy_tuning:
+            alpha_loss = -(self.log_alpha() * (log_pi + self.config.target_entropy).detach()).mean()
+            alpha = self.log_alpha().exp() * self.config.alpha_multiplier
+        else:
+            alpha_loss = observations.new_tensor(0.0)
+            alpha = observations.new_tensor(self.config.alpha_multiplier)
+
+        """ Policy loss """
+        if bc:
+            log_probs = self.policy.log_prob(observations, actions)
+            policy_loss = (alpha*log_pi - log_probs).mean()
+        else:
+            q_new_actions = torch.min(
+                self.qf1(observations, new_actions),
+                self.qf2(observations, new_actions),
+            )
+            policy_loss = (alpha*log_pi - q_new_actions).mean()
+
+        """ Q function loss """
+        q1_pred = self.qf1(observations, actions)
+        q2_pred = self.qf2(observations, actions)
+
+        if self.config.cql_max_target_backup:
+            new_next_actions, next_log_pi = self.policy(next_observations, repeat=self.config.cql_n_actions)
+            target_q_values, max_target_indices = torch.max(
+                torch.min(
+                    self.target_qf1(next_observations, new_next_actions),
+                    self.target_qf2(next_observations, new_next_actions),
+                ),
+                dim=-1
+            )
+            next_log_pi = torch.gather(next_log_pi, -1, max_target_indices.unsqueeze(-1)).squeeze(-1)
+        else:
+            new_next_actions, next_log_pi = self.policy(next_observations)
+            target_q_values = torch.min(
+                self.target_qf1(next_observations, new_next_actions),
+                self.target_qf2(next_observations, new_next_actions),
+            )
+
+        if self.config.backup_entropy:
+            target_q_values = target_q_values - alpha * next_log_pi
+
+        td_target = rewards + (1. - dones) * self.config.discount * target_q_values
+        qf1_loss = F.mse_loss(q1_pred, td_target.detach())
+        qf2_loss = F.mse_loss(q2_pred, td_target.detach())
+
+
+        ### CQL
+        if not self.config.use_cql:
+            qf_loss = qf1_loss + qf2_loss
+        else:
+            batch_size = actions.shape[0]
+            action_dim = actions.shape[-1]
+            cql_random_actions = actions.new_empty((batch_size, self.config.cql_n_actions, action_dim), requires_grad=False).uniform_(-1, 1)
+            cql_current_actions, cql_current_log_pis = self.policy(observations, repeat=self.config.cql_n_actions)
+            cql_next_actions, cql_next_log_pis = self.policy(next_observations, repeat=self.config.cql_n_actions)
+            cql_current_actions, cql_current_log_pis = cql_current_actions.detach(), cql_current_log_pis.detach()
+            cql_next_actions, cql_next_log_pis = cql_next_actions.detach(), cql_next_log_pis.detach()
+
+            cql_q1_rand = self.qf1(observations, cql_random_actions)
+            cql_q2_rand = self.qf2(observations, cql_random_actions)
+            cql_q1_current_actions = self.qf1(observations, cql_current_actions)
+            cql_q2_current_actions = self.qf2(observations, cql_current_actions)
+            cql_q1_next_actions = self.qf1(observations, cql_next_actions)
+            cql_q2_next_actions = self.qf2(observations, cql_next_actions)
+
+            cql_cat_q1 = torch.cat(
+                [cql_q1_rand, torch.unsqueeze(q1_pred, 1), cql_q1_next_actions, cql_q1_current_actions], dim=1
+            )
+            cql_cat_q2 = torch.cat(
+                [cql_q2_rand, torch.unsqueeze(q2_pred, 1), cql_q2_next_actions, cql_q2_current_actions], dim=1
+            )
+            cql_std_q1 = torch.std(cql_cat_q1, dim=1)
+            cql_std_q2 = torch.std(cql_cat_q2, dim=1)
+
+            if self.config.cql_importance_sample:
+                random_density = np.log(0.5 ** action_dim)
+                cql_cat_q1 = torch.cat(
+                    [cql_q1_rand - random_density,
+                     cql_q1_next_actions - cql_next_log_pis.detach(),
+                     cql_q1_current_actions - cql_current_log_pis.detach()],
+                    dim=1
+                )
+                cql_cat_q2 = torch.cat(
+                    [cql_q2_rand - random_density,
+                     cql_q2_next_actions - cql_next_log_pis.detach(),
+                     cql_q2_current_actions - cql_current_log_pis.detach()],
+                    dim=1
+                )
+
+            cql_qf1_ood = torch.logsumexp(cql_cat_q1 / self.config.cql_temp, dim=1) * self.config.cql_temp
+            cql_qf2_ood = torch.logsumexp(cql_cat_q2 / self.config.cql_temp, dim=1) * self.config.cql_temp
+
+            """Subtract the log likelihood of data"""
+            cql_qf1_diff = torch.clamp(
+                cql_qf1_ood - q1_pred,
+                self.config.cql_clip_diff_min,
+                self.config.cql_clip_diff_max,
+            ).mean()
+            cql_qf2_diff = torch.clamp(
+                cql_qf2_ood - q2_pred,
+                self.config.cql_clip_diff_min,
+                self.config.cql_clip_diff_max,
+            ).mean()
+
+            if self.config.cql_lagrange:
+                alpha_prime = torch.clamp(torch.exp(self.log_alpha_prime()), min=0.0, max=1000000.0)
+                cql_min_qf1_loss = alpha_prime * self.config.cql_min_q_weight * (cql_qf1_diff - self.config.cql_target_action_gap)
+                cql_min_qf2_loss = alpha_prime * self.config.cql_min_q_weight * (cql_qf2_diff - self.config.cql_target_action_gap)
+
+                self.alpha_prime_optimizer.zero_grad()
+                alpha_prime_loss = (-cql_min_qf1_loss - cql_min_qf2_loss)*0.5
+                alpha_prime_loss.backward(retain_graph=True)
+                self.alpha_prime_optimizer.step()
+            else:
+                cql_min_qf1_loss = cql_qf1_diff * self.config.cql_min_q_weight
+                cql_min_qf2_loss = cql_qf2_diff * self.config.cql_min_q_weight
+                alpha_prime_loss = observations.new_tensor(0.0)
+                alpha_prime = observations.new_tensor(0.0)
+
+
+            qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
+
+
+        if self.config.use_automatic_entropy_tuning:
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        self.policy_optimizer.step()
+
+        self.qf_optimizer.zero_grad()
+        qf_loss.backward()
+        self.qf_optimizer.step()
+
+        if self.total_steps % self.config.target_update_period == 0:
+            self.update_target_network(
+                self.config.soft_target_update_rate
+            )
+
+
+        metrics = dict(
+            log_pi=log_pi.mean().item(),
+            policy_loss=policy_loss.item(),
+            qf1_loss=qf1_loss.item(),
+            qf2_loss=qf2_loss.item(),
+            alpha_loss=alpha_loss.item(),
+            alpha=alpha.item(),
+            average_qf1=q1_pred.mean().item(),
+            average_qf2=q2_pred.mean().item(),
+            average_target_q=target_q_values.mean().item(),
+            total_steps=self.total_steps,
+        )
+
+        if self.config.use_cql:
+            metrics.update(prefix_metrics(dict(
+                cql_std_q1=cql_std_q1.mean().item(),
+                cql_std_q2=cql_std_q2.mean().item(),
+                cql_q1_rand=cql_q1_rand.mean().item(),
+                cql_q2_rand=cql_q2_rand.mean().item(),
+                cql_min_qf1_loss=cql_min_qf1_loss.mean().item(),
+                cql_min_qf2_loss=cql_min_qf2_loss.mean().item(),
+                cql_qf1_diff=cql_qf1_diff.mean().item(),
+                cql_qf2_diff=cql_qf2_diff.mean().item(),
+                cql_q1_current_actions=cql_q1_current_actions.mean().item(),
+                cql_q2_current_actions=cql_q2_current_actions.mean().item(),
+                cql_q1_next_actions=cql_q1_next_actions.mean().item(),
+                cql_q2_next_actions=cql_q2_next_actions.mean().item(),
+                alpha_prime_loss=alpha_prime_loss.item(),
+                alpha_prime=alpha_prime.item(),
+            ), 'cql'))
+
+        return metrics
+
+    def torch_to_device(self, device):
+        for module in self.modules:
+            module.to(device)
+
+    @property
+    def modules(self):
+        modules = [self.policy, self.qf1, self.qf2, self.target_qf1, self.target_qf2]
+        if self.config.use_automatic_entropy_tuning:
+            modules.append(self.log_alpha)
+        if self.config.cql_lagrange:
+            modules.append(self.log_alpha_prime)
+        return modules
+
+    @property
+    def total_steps(self):
+        return self._total_steps
+
+################## Flags #############################
+FLAGS_DEF = define_flags_with_default(
+    env='halfcheetah-medium-v2',
+    max_traj_length=1000,
+    seed=42,
+    device='cuda',
+    save_model=False,
+    batch_size=256,
+
+    reward_scale=1.0,
+    reward_bias=0.0,
+    clip_action=0.999,
+
+    policy_arch='256-256',
+    qf_arch='256-256',
+    orthogonal_init=False,
+    policy_log_std_multiplier=1.0,
+    policy_log_std_offset=-1.0,
+
+    n_epochs=2000,
+    bc_epochs=0,
+    n_train_step_per_epoch=1000,
+    eval_period=10,
+    eval_n_trajs=5,
+
+    cql=ConservativeSAC.get_default_config(),
+    logging=WandBLogger.get_default_config(),
+)
+
+################## Policy Definition ###########################
+
+def CQLSAC():
+	FLAGS = absl.flags.FLAGS
+	eval_sampler = dataset
+	policy = TanhGaussianPolicy(
+		eval_sampler.env.observation_space.shape[0],
+		eval_sampler.env.action_space.shape[0],
+		arch=FLAGS.policy_arch,
+		log_std_multiplier=FLAGS.policy_log_std_multiplier,
+		log_std_offset=FLAGS.policy_log_std_offset,
+		orthogonal_init=FLAGS.orthogonal_init,
+	)
+
+	qf1 = FullyConnectedQFunction(
+		eval_sampler.env.observation_space.shape[0],
+		eval_sampler.env.action_space.shape[0],
+		arch=FLAGS.qf_arch,
+		orthogonal_init=FLAGS.orthogonal_init,
+	)
+	target_qf1 = deepcopy(qf1)
+
+	qf2 = FullyConnectedQFunction(
+		eval_sampler.env.observation_space.shape[0],
+		eval_sampler.env.action_space.shape[0],
+		arch=FLAGS.qf_arch,
+		orthogonal_init=FLAGS.orthogonal_init,
+	)
+	target_qf2 = deepcopy(qf2)
+
+	if FLAGS.cql.target_entropy >= 0.0:
+		FLAGS.cql.target_entropy = -np.prod(eval_sampler.env.action_space.shape).item()
+
+	sac = ConservativeSAC(FLAGS.cql, policy, qf1, qf2, target_qf1, target_qf2)
+	sac.torch_to_device(FLAGS.device)
+
+	sampler_policy = SamplerPolicy(policy, FLAGS.device)
+
+'''
+#################################################################################################################################
+'''
 def hidden_init(layer):
     fan_in = layer.weight.data.size()[0]
     lim = 1. / np.sqrt(fan_in)
@@ -780,6 +1271,7 @@ class CQLSAC(nn.Module):
         """
         for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
             target_param.data.copy_(self.tau*local_param.data + (1.0-self.tau)*target_param.data)
+'''
 
 '''
 class Actor_CQL(nn.Module):
@@ -1344,11 +1836,10 @@ def calculate_huber_loss(td_errors, k=1.0):
 '''
 
 ######################### Train ####################################
-def train(dataset, state_dim=24, action_dim=2, epochs=3000, train=True, model = "TD3_BC"):  
+def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True, model = "TD3_BC"):  
 	print("start Training")
 	# Environment State Properties
 	max_action = 1
-	normalize = True
     # Agent parameters
 	args = {
         # Experiment
@@ -1359,7 +1850,7 @@ def train(dataset, state_dim=24, action_dim=2, epochs=3000, train=True, model = 
         "save_model": "store_true",
         "load_model": "",                 # Model load file name, "" doesn't load, "default" uses file_name
         # TD3
-        "expl_noise": 0.1,
+        "expl_noise": 0.3,
         "batch_size": 256,
         "discount": 0.99,
         "tau": 0.005,
@@ -1367,7 +1858,7 @@ def train(dataset, state_dim=24, action_dim=2, epochs=3000, train=True, model = 
         "noise_clip": 0.5,
         "policy_freq": 2,
         # TD3 + BC
-        "alpha": 2.5,
+        "alpha": 3.,#2.5
         "normalize": True,
         "state_dim": 14,
         "action_dim": 3,
@@ -1397,7 +1888,6 @@ def train(dataset, state_dim=24, action_dim=2, epochs=3000, train=True, model = 
 		print(f"Policy: {args['policy']}")
 		print("---------------------------------------")
 		if train == True:
-			batch_size = 256
 			alpha_losses = []
 			critic1_losses = []
 			critic2_losses = []
@@ -1438,50 +1928,62 @@ def train(dataset, state_dim=24, action_dim=2, epochs=3000, train=True, model = 
 		print(f"Policy: {args['policy']}")	#, Seed: {args['seed']}")
 		print("---------------------------------------")
 		if train == True:
-			batch_size = 256
 			a_losses = []
 			c_losses = []
+			evaluation_losses = []
 
 			
-			trajectory_rewards = dataset['rewards'][dataset['terminals']==True]
+			trajectory_rewards = dataset['rewards'][dataset['terminals']]
+
 			prob_dist = np.ones(len(trajectory_rewards))	#len(dataset['trial'].unique())-10)#-1 Because last trial has no terminal state (to be changed in future)
 
-			prob_dist[trajectory_rewards != -10.0] = 500	#50 times higher probs than other traj to be sampled
+			prob_dist[trajectory_rewards != -10.0] = 50	#500 times higher probs than other traj to be sampled
 			prob_dist = prob_dist/prob_dist.sum()
 			
 			for i in tqdm(range(1, epochs)):
-				trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset)    
+				trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 	   
 
 				#trajectory = sample(dataset)
-				c_loss, a_loss = policy.train(trajectory, batch_size = 32)	#, args, **kwargs
+				c_loss, a_loss = policy.train(trajectory, batch_size = 256)	#, args, **kwargs
 				if a_loss != 0.0:	#actor loss updated only once every "policy_freq" update, set to 0 otherwise
 					a_losses.append(a_loss)
 				c_losses.append(c_loss)
+
 				
-				if i%10 == 0:
+				if i%2000 == 0:
+					plot_animated_learnt_policy(test_set, policy, i)
+				
+				if i%1000 == 0:
+					#evaluate_agent_performance(test_set, policy)
+					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy,i)
+					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
 					policy.save("models/TD3_BC_policy")
+			
+			_, evaluation_loss_curve = plt.subplots()
+			evaluation_loss_curve.plot(evaluation_losses)
+			plt.savefig('training_plots/TD3_BC/evaluation_losses_during_training.png')
+
 			_, actor_loss_curve = plt.subplots()
 			actor_loss_curve.plot(a_losses)
-			plt.savefig('training_plots/actor_losses_training_curve.png')
+			plt.savefig('training_plots/TD3_BC/actor_losses_training_curve.png')
 
 			_, critic_loss_curve = plt.subplots()
 			critic_loss_curve.plot(c_losses)
-			plt.savefig('training_plots/critic_losses_training_curve.png')
+			plt.savefig('training_plots/TD3_BC/critic_losses_training_curve.png')
 		else:
 			print("load trained model")
-			policy.load("models/TD3_BC_policy")
+			policy.load("models/batch_size_256_non_weighted_sample/TD3_BC_policy")
 	else:
 		print(model, "is not implemented")
 		policy=None
 	return policy
 ######################### Evaluation ####################################
-def evaluate(dataset, policy):
-	print("start Evaluation")
+def evaluate_agent_performance(dataset, policy):
 	rewards = []
-	print("len dataset: ", len(dataset['trial'].unique()))
+	rewards_human = []
 
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
-		states, actions, new_states, reward, terminals= get_trajectory(dataset, trial)
+		states, actions, new_states, reward_, terminals= get_trajectory(dataset, trial)
 		
 		state = states[0][:]
 		pi_e = policy.select_action(state)
@@ -1490,6 +1992,7 @@ def evaluate(dataset, policy):
 		state_cue_front = state[8:10]
 		state_cue_back = state[10:12]
 
+		reward_human = reward_[terminals == True]
 		reward = 0
 		for k in range(states.size(dim=0)):
 			#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
@@ -1499,38 +2002,70 @@ def evaluate(dataset, policy):
 				next_state_cueball = update_cueballpos(state_cueball, cuevel)
 				states[k][0:2] = next_state_cueball
 				states[k][2:4] = cuevel
-				compute_reward_evaluation(cuevel.detach().numpy(), state[6:8].detach().numpy(), reward)
-				#reward = compute_reward_evaluation(cuevel.detach().numpy(), state[6:8].detach().numpy(), reward)
+				reward = compute_reward_evaluation(cuevel.detach().numpy(), state[6:8].detach().numpy(), reward)
 			states[k][8:10] = next_state_cue_front
 			states[k][10:12] = next_state_cue_back
 			pi_e = policy.select_action(states[k][:])
 			cuevel = pi_e[1:]
 		rewards = np.append(rewards, reward)
-	print("number of successful trials: ", np.count_nonzero(rewards), rewards)
-def evaluate_close_to_human_behaviour(dataset, policy):
-	print("start Evaluation")
-	losses = []
-	avg_loss = 0.0
+		rewards_human = np.append(rewards_human, reward_human)
+	print("number of successful trials agent: ", np.count_nonzero(rewards), rewards)
+	print("number of successful trials human subject: ", np.count_nonzero(rewards_human), rewards_human)
+
+def evaluate_close_to_human_behaviour(dataset, policy, iteration):
+	#losses = []
+	#avg_loss = 0.0
 
 	## Actions Visualisation
+	epoch_loss_ = []
+	epoch_loss_u_ = []
 	behaviour_actions_ = []
 	agent_actions_ = []
 	behaviour_actions_u_ = []
 	agent_actions_u_ = []
 	count_successful_trajectory = 0
 	count_unsuccessful_trajectory = 0
-	print("len dataset: ", len(dataset['trial'].unique()))
+	successful_trajectory = []
+	unsuccessful_trajectory = []
+
+
+	angle_b_ = []
+	vel_x_b_ = []
+	vel_z_b_ = []
+
+	angle_e_ = []
+	vel_x_e_ = []
+	vel_z_e_ = []
+
+	angle_b_u_ = []
+	vel_x_b_u_ = []
+	vel_z_b_u_ = []
+
+	angle_e_u_ = []
+	vel_x_e_u_ = []
+	vel_z_e_u_ = []
 
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
-		epoch_loss = 0.0
+		loss = 0.0
 		#states, actions, new_states, reward, terminals= sample(dataset)
 		#print("not terminals: ", terminals)
 		states, actions, new_states, reward, terminals= get_trajectory(dataset, trial)
 		if torch.any(terminals) == True:
 			if reward[terminals] != -10.0:
+				count_successful_trajectory += 1
+				successful_trajectory = np.append(successful_trajectory, i)
+				## loss
+				epoch_loss = np.zeros(states.size(dim=0))
 				## Actions Visualisation
-				behaviour_actions = np.zeros(states.size(dim=0))
-				agent_actions = np.zeros(states.size(dim=0))
+				behaviour_actions = np.zeros((states.size(dim=0),3))
+				agent_actions = np.zeros((states.size(dim=0),3))
+				angle_b = np.zeros((states.size(dim=0)))
+				vel_x_b = np.zeros((states.size(dim=0)))
+				vel_z_b = np.zeros((states.size(dim=0)))
+
+				angle_e = np.zeros((states.size(dim=0)))
+				vel_x_e = np.zeros((states.size(dim=0)))
+				vel_z_e = np.zeros((states.size(dim=0)))
 				## Actions Visualisation
 
 				for k in range(states.size(dim=0)):
@@ -1538,42 +2073,148 @@ def evaluate_close_to_human_behaviour(dataset, policy):
 					pi_e = policy.select_action(states[k][:])
 					pi_b = actions[k][:]
 					#print("step ", k, pi_e, pi_b)
-					epoch_loss += F.mse_loss(pi_e, pi_b)
+					epoch_loss[k] = F.mse_loss(pi_e, pi_b)
+					loss += F.mse_loss(pi_e, pi_b)
 
 					## Actions Visualisation
-					behaviour_actions[k] = pi_b.detach().numpy()[1]
-					agent_actions[k] = pi_e.detach().numpy()[1]
-				behaviour_actions_ = np.append(behaviour_actions_, behaviour_actions)
-				agent_actions_ = np.append(agent_actions_, agent_actions)
-				count_successful_trajectory += 1
+					angle_b[k] = pi_b[0].detach().numpy()
+					vel_x_b[k] = pi_b[1].detach().numpy()
+					vel_z_b[k] = pi_b[2].detach().numpy()
+
+					angle_e[k] = pi_e[0].detach().numpy()
+					vel_x_e[k] = pi_e[1].detach().numpy()
+					vel_z_e[k] = pi_e[2].detach().numpy()
+
+					behaviour_actions[k,:] = pi_b.detach().numpy()#[1]
+					agent_actions[k,:] = pi_e.detach().numpy()#[1]
+
+
+				angle_b_ = np.append(angle_b_, angle_b)
+				vel_x_b_ = np.append(vel_x_b_, vel_x_b)
+				vel_z_b_ = np.append(vel_z_b_, vel_z_b)
+
+				angle_e_ = np.append(angle_e_, angle_e)
+				vel_x_e_ = np.append(vel_x_e_, vel_x_e)
+				vel_z_e_ = np.append(vel_z_e_, vel_z_e)
+
+				epoch_loss_ = np.append(epoch_loss_ , epoch_loss)
+				#behaviour_actions_ = np.append(behaviour_actions_, behaviour_actions)
+				#agent_actions_ = np.append(agent_actions_, agent_actions)
+
+			
+			elif reward[terminals] == -10.0:
+				count_unsuccessful_trajectory += 1
+				unsuccessful_trajectory = np.append(unsuccessful_trajectory, i)
+				## loss
+				epoch_loss_u = np.zeros(states.size(dim=0))
+				## Actions Visualisation
+				angle_b_u = np.zeros((states.size(dim=0)))
+				vel_x_b_u = np.zeros((states.size(dim=0)))
+				vel_z_b_u = np.zeros((states.size(dim=0)))
+
+				angle_e_u = np.zeros((states.size(dim=0)))
+				vel_x_e_u = np.zeros((states.size(dim=0)))
+				vel_z_e_u = np.zeros((states.size(dim=0)))
 				## Actions Visualisation
 
-
-				epoch_loss = epoch_loss/states.size(dim=0)
-				losses.append(epoch_loss.detach().numpy())
-
-			## Actions Visualisation
-			elif reward[terminals] == -10.0:
-				#print("terminal rewrds: ", j*trial, reward[terminals])
-				behaviour_actions_u = np.zeros(states.size(dim=0))
-				agent_actions_u = np.zeros(states.size(dim=0))
 				for k in range(states.size(dim=0)):
-
 					#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-					pi_e = policy.select_action(states[k][:])
-					pi_b = actions[k][:]
+					pi_e_u = policy.select_action(states[k][:])
+					pi_b_u = actions[k][:]
+					epoch_loss_u[k] = F.mse_loss(pi_e_u, pi_b_u)
+					loss += F.mse_loss(pi_e_u, pi_b_u)
 
-					behaviour_actions_u[k] = pi_b.detach().numpy()[1]
-					agent_actions_u[k] = pi_e.detach().numpy()[1]
-				behaviour_actions_u_ = np.append(behaviour_actions_u_, behaviour_actions_u)
-				agent_actions_u_ = np.append(agent_actions_u_, agent_actions_u)
-				count_unsuccessful_trajectory += 1
+					## Actions Visualisation
+					angle_b_u[k] = pi_b_u[0].detach().numpy()
+					vel_x_b_u[k] = pi_b_u[1].detach().numpy()
+					vel_z_b_u[k] = pi_b_u[2].detach().numpy()
+
+					angle_e_u[k] = pi_e_u[0].detach().numpy()
+					vel_x_e_u[k] = pi_e_u[1].detach().numpy()
+					vel_z_e_u[k] = pi_e_u[2].detach().numpy()
+
+
+				angle_b_u_ = np.append(angle_b_u_, angle_b_u)
+				vel_x_b_u_ = np.append(vel_x_b_u_, vel_x_b_u)
+				vel_z_b_u_ = np.append(vel_z_b_u_, vel_z_b_u)
+
+				angle_e_u_ = np.append(angle_e_u_, angle_e_u)
+				vel_x_e_u_ = np.append(vel_x_e_u_, vel_x_e_u)
+				vel_z_e_u_ = np.append(vel_z_e_u_, vel_z_e_u)
+
+				epoch_loss_u_ = np.append(epoch_loss_u_ , epoch_loss_u)
 		else:
 			print("No terminal state in trial ", trial, terminals)
 		## Actions Visualisation
 
-	print("count_unsuccessful_trajectory: ", count_unsuccessful_trajectory, "count_successful_trajectory: ", count_successful_trajectory)
-	## Actions Visualisation
+	#print("number of test trials: ", len(dataset['trial'].unique()), "count_unsuccessful_trajectory: ", count_unsuccessful_trajectory, "count_successful_trajectory: ", count_successful_trajectory)
+	
+	X_s = []
+	X_u = []
+	
+	fig, mean_b = plt.subplots()
+	mean_b.set_xlabel("timesteps")
+	mean_b.set_ylabel("Angle")
+	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
+	#X = np.arange(1, len(dataset['trial'])+1) 
+	for i in range(count_successful_trajectory):   
+		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
+		mean_b.plot(X_s, angle_b_[i*140:(i+1)*140], color='blue')
+		mean_b.plot(X_s, angle_e_[i*140:(i+1)*140], color='green')
+	for i in range(count_unsuccessful_trajectory):
+		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
+		mean_b.plot(X_u, angle_b_u_[i*140:(i+1)*140], color='blue')
+		mean_b.plot(X_u, angle_e_u_[i*140:(i+1)*140], color='red')
+	#mean_b.legend()
+	#fig.tight_layout()
+	fig.savefig('training_plots/TD3_BC/iter_'+str(iteration)+'_angle_behaviour_agent.png')
+
+	fig, mean_b = plt.subplots()
+	mean_b.set_xlabel("timesteps")
+	mean_b.set_ylabel("Velocity x-axis")
+	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
+	for i in range(count_successful_trajectory):   
+		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
+		mean_b.plot(X_s, vel_x_b_[i*140:(i+1)*140], color='blue')
+		mean_b.plot(X_s, vel_x_e_[i*140:(i+1)*140], color='green')
+	for i in range(count_unsuccessful_trajectory):
+		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
+		mean_b.plot(X_u, vel_x_b_u_[i*140:(i+1)*140], color='blue')
+		mean_b.plot(X_u, vel_x_e_u_[i*140:(i+1)*140], color='red')
+	#mean_b.legend()
+	#fig.tight_layout()
+	fig.savefig('training_plots/TD3_BC/iter_'+str(iteration)+'_vel_x_behaviour_agent.png')
+
+	fig, mean_b = plt.subplots()
+	mean_b.set_xlabel("timesteps")
+	mean_b.set_ylabel("Velocity z-axis")
+	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
+	for i in range(count_successful_trajectory):   
+		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
+		mean_b.plot(X_s, vel_z_b_[i*140:(i+1)*140], color='blue')
+		mean_b.plot(X_s, vel_z_e_[i*140:(i+1)*140], color='green')
+	for i in range(count_unsuccessful_trajectory):
+		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
+		mean_b.plot(X_u, vel_z_b_u_[i*140:(i+1)*140], color='blue')
+		mean_b.plot(X_u, vel_z_e_u_[i*140:(i+1)*140], color='red')
+	#mean_b.legend()
+	#fig.tight_layout()
+	fig.savefig('training_plots/TD3_BC/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')
+
+	fig, mean_b = plt.subplots()
+	mean_b.set_xlabel("timesteps")
+	mean_b.set_ylabel("MSE loss")
+	fig.suptitle('MSE loss between Behaviour and Agent policy', fontsize=16, y=1.04)  
+	for i in range(count_successful_trajectory):   
+		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
+		mean_b.plot(X_s, epoch_loss_[i*140:(i+1)*140], color='green')
+	for i in range(count_unsuccessful_trajectory):
+		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
+		mean_b.plot(X_u, epoch_loss_u_[i*140:(i+1)*140], color='red')
+	#fig.tight_layout()
+	fig.savefig('training_plots/TD3_BC/iter_'+str(iteration)+'_MSE_loss_between_actions.png')
+
+	'''## Actions Visualisation
 	behaviour_actions_graph = np.zeros((count_successful_trajectory, 50))    
 	agent_actions_graph = np.zeros((count_successful_trajectory, 50))   
 	
@@ -1620,11 +2261,11 @@ def evaluate_close_to_human_behaviour(dataset, policy):
 	evaluation_loss_curve.plot(losses)
 	ev_fig.savefig('training_plots/evaluation_losses.png')
 	avg_loss = sum(losses)/len(losses)
-	print("Average Evaluation loss: ", avg_loss)
+	print("Average Evaluation loss: ", avg_loss)'''
+	plt.close()
+	return loss/len(dataset["trial"])
 
 def plot_animated_behaviour_policy(dataset):
-	import matplotlib.animation as animation
-
 	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[0])
 	states = states.detach().numpy()
 
@@ -1634,17 +2275,16 @@ def plot_animated_behaviour_policy(dataset):
 		ax.clear()
 		x_values = [states[i,10], states[i,8]]
 		z_values = [states[i,11], states[i,9]]
-		ax.plot(x_values, z_values, color="blue")
+		ax.plot(x_values, z_values, color="blue", label = 'cue stick')
 
 		x_val = states[i,0]
 		z_val = states[i,1]
-		ax.plot(x_val, z_val, ms=7, color='black', marker='o')
+		ax.scatter(x_val, z_val, s=60, facecolors='black', edgecolors='black', label = 'cueball')
 		
-		
-		ax.plot(states[0][4], states[0][5], ms=7, color="red", marker='o')
-		ax.plot(states[0][6], states[0][7], ms=12, color='green', marker='o')
+		ax.scatter(states[i][4], states[i][5], s=60, facecolors='red', edgecolors='red', label = 'target ball')
+		ax.scatter(states[i][6], states[i][7], s=400, facecolors='none', edgecolors='green', label = 'pocket')
 		ax.set(xlim=(-2, 2), ylim=(-2, 2))
-		#return line, point,
+		ax.legend()
 
 
 	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=20, repeat=False)	
@@ -1652,29 +2292,48 @@ def plot_animated_behaviour_policy(dataset):
 	anim.save('training_plots/Agent_policy3.gif', writer='imagemagick')	
 	print("saved GIF")
 
-def plot_animated_learnt_policy(dataset, policy):
-	import matplotlib.animation as animation
+def plot_animated_learnt_policy(dataset, policy, iteration=44):
 
-	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[131])
+	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[31])
 	states = states.detach().numpy()
-	actions = policy.select_action(states).detach().numpy()
 	fig, ax = plt.subplots(1,1)
 	
+	#actions = policy.select_action(states).detach().numpy()
 	
+	
+	'''fig, mean_b = plt.subplots()
+	mean_b.set_xlabel("timesteps")
+	mean_b.set_ylabel("Vel")
+	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
+	X = np.arange(1, len(states)+1)
+	#mean_b.plot(X, actions[:,0], color='green', label='angle')
+	mean_b.plot(X, actions[:,1], color='blue', label='vel_x')#, linestyle='None', marker='^')
+	mean_b.plot(X, actions[:,2], color='red', label='vel_z')
+	mean_b.legend()
+	fig.tight_layout()
+	fig.savefig('training_plots/actions.png')
+	plt.close()'''
 
-	cuevel = actions[:,1:]	#Warning: modify if actions has more than 3 action
-	cueposfront = np.zeros((actions.shape[0],2))
-	cueposback = np.zeros((actions.shape[0],2))
+	cueposfront = np.zeros((states.shape[0],2))
+	cueposback = np.zeros((states.shape[0],2))
 	cueposfront[0][0] = states[0,8]
 	cueposfront[0][1] = states[0,9]
 	cueposback[0][0] = states[0,10]
 	cueposback[0][1] = states[0,11]
+	actions = policy.select_action(states[0,:]).detach().numpy()
 
 	dt = 0.0111
 	for i in range(1, actions.shape[0]-1):
 		#cueposfront[i][:], cueposback[i][:] = update_cuepos(cueposfront[i-1][:], cueposback[i-1][:], cuevel[i][:])
-		cueposfront[i][:] = cueposfront[i-1][:] + cuevel[i][:]*dt
-		cueposback[i][:] = cueposback[i-1][:] + cuevel[i][:]*dt
+		cueposfront[i][:] = cueposfront[i-1][:] + actions[1:]*dt
+		cueposback[i][:] = cueposback[i-1][:] + actions[1:]*dt
+		#update states
+		states[i,8] = cueposfront[i][0]
+		states[i,9] = cueposfront[i][1]
+		states[i,10] = cueposback[i][0]
+		states[i,11] = cueposback[i][1]
+		actions = policy.select_action(states[i,:]).detach().numpy()
+
 	cueballpos = np.zeros((states.shape[0],2))
 	cueballpos[0][0] = states[0][0]
 	cueballpos[0][1] = states[0][1]
@@ -1686,43 +2345,30 @@ def plot_animated_learnt_policy(dataset, policy):
 		#z_values = [states[i,11], states[i,9]]
 		z_values = [cueposback[i][1], cueposfront[i][1]]
 		#line.set_data(x_values, z_values)
-		ax.plot(x_values, z_values, color="blue")
+		ax.plot(x_values, z_values, color="blue", label = 'cue stick')
 
-		#ax.plot(cueposfront[i][0], cueposfront[i][1], ms=7, color="red", marker='o')
-		#ax.plot(cueposback[i][0], cueposback[i][1], ms=5, color="brown", marker='o')
 		x_val = states[i,0]	#cueballpos[i,0]	
 		z_val = states[i,1]	#cueballpos[i,1]	
-		#point.set_data(x_values, z_values)
-		ax.plot(x_val, z_val, ms=7, color='black', marker='o')
+		ax.scatter(x_val, z_val, s=60, facecolors='black', edgecolors='black', label = 'cueball')
 		
-		
-		ax.plot(states[i][4], states[i][5], ms=7, color="red", marker='o', label = str(i))
-		ax.plot(states[i][6], states[i][7], ms=12, color='green', marker='o', label = str(actions[i][0]))	
+		ax.scatter(states[i][4], states[i][5], s=60, facecolors='red', edgecolors='red', label = 'target ball')
+		ax.scatter(states[i][6], states[i][7], s=400, facecolors='none', edgecolors='green', label = 'pocket')
 		ax.set(xlim=(-2, 2), ylim=(-2, 2))
 		ax.legend()
 
+		'''ax.scatter(0, 0, ms=7,facecolors='none', edgecolors='none', label = str(i))
+		ax.plot(1, 1, ms=7,facecolors='none', edgecolors='none', label = str(actions[i][0]))'''
 
-	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=20, repeat=False)	#init_func=init, blit=True
+
+	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=20, repeat=False)	
 	plt.close()
-	#from matplotlib.animation import PillowWriter
-	anim.save('training_plots/Agent_learnt_policy.gif', writer='imagemagick')	#dpi=300, writer=PillowWriter(fps=1))	#imagemagick
-	print("saved GIF")
+	anim.save('training_plots/TD3_BC/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')	
+	#print("saved GIF")
 ########################## Main  ########################################
 
 if __name__ == "__main__":
-	#filename = []
-	#path = "/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/TD3_BC/RL_dataset/Offline_reduced/"
-    #for file in sorted(os.listdir(path)):
-		#filename.append(path+file)
 
-	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
-    #"RL_dataset/Offline_reduced/JW_Offline_reduced.csv", "RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
-    #"RL_dataset/Offline_reduced/GS_Offline_reduced.csv", "RL_dataset/Offline_reduced/CX_Offline_reduced.csv", "RL_dataset/Offline_reduced/CP_Offline_reduced.csv",
-    #"RL_dataset/Offline_reduced/KO_Offline_reduced.csv"]
-    #"RL_dataset/Offline_reduced/AS_Offline_reduced.csv"
-	
-
-    filename = ["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv","RL_dataset/Offline_reduced/BL_Offline_reduced.csv"]
+    filename = ["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"]	#"RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv","RL_dataset/Offline_reduced/BL_Offline_reduced.csv"]
     '''["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
     "RL_dataset/Offline_reduced/BR_Offline_reduced.csv", "RL_dataset/Offline_reduced/BY_Offline_reduced.csv", "RL_dataset/Offline_reduced/CP_Offline_reduced.csv",
      "RL_dataset/Offline_reduced/DR_Offline_reduced.csv", "RL_dataset/Offline_reduced/DS_Offline_reduced.csv",
@@ -1730,14 +2376,12 @@ if __name__ == "__main__":
     "RL_dataset/Offline_reduced/KO_Offline_reduced.csv", "RL_dataset/Offline_reduced/LR_Offline_reduced.csv",
     "RL_dataset/Offline_reduced/JW_Offline_reduced.csv", "RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
     "RL_dataset/Offline_reduced/GS_Offline_reduced.csv"]'''	
-				#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv"]	"RL_dataset/Offline_reduced/CX_Offline_reduced.csv",
-	#train_set, test_set = load_data(filename)
+
     train_set, test_set = load_clean_data(filename)
-	#state_dim=24, action_dim=2  
-	#state dim must be multiple of 6
-    policy = train(train_set,state_dim=14, action_dim=3, epochs=10000, train=False, model="TD3_BC")	#TD3_BC #set train=False to load pretrained model
+	
+    policy = train(train_set, test_set, state_dim=14, action_dim=3, epochs=10000, train=True, model="TD3_BC")	#TD3_BC #set train=False to load pretrained model
 
 
-    evaluate(train_set, policy)
+    #evaluate(train_set, policy)
     #plot_animated_behaviour_policy(test_set)
-    plot_animated_learnt_policy(test_set, policy)
+    #plot_animated_learnt_policy(test_set, policy)
