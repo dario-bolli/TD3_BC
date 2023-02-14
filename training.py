@@ -33,17 +33,101 @@ import argparse
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+'''import gym
+import argparse
+import os
+import d4rl
+
+import utils
+import warnings
+warnings.filterwarnings("ignore")'''
+######################################################## Eval policy D4RL ######################################################################
+# Runs policy for X episodes and returns D4RL score
+# A fixed seed is used for the eval environment
+def eval_policy(policy, env_name, seed, mean, std, seed_offset=100, eval_episodes=10):
+	eval_env = gym.make(env_name)
+	eval_env.seed(seed + seed_offset)
+
+	avg_reward = 0.
+	for _ in range(eval_episodes):
+		state, done = eval_env.reset(), False
+		while not done:
+			state = (np.array(state).reshape(1,-1) - mean)/std
+			action = policy.select_action(state).squeeze().detach().numpy()
+			state, reward, done, _ = eval_env.step(action)
+			avg_reward += reward
+
+	avg_reward /= eval_episodes
+	d4rl_score = eval_env.get_normalized_score(avg_reward) * 100
+
+	print("---------------------------------------")
+	print(f"Evaluation over {eval_episodes} episodes: {avg_reward:.3f}, D4RL score: {d4rl_score:.3f}")
+	print("---------------------------------------")
+	return avg_reward, d4rl_score
+
+def load_d4rl_scores(filename_d4rl, filename_reward, model):
+	d4rl_score = np.load(filename_d4rl)
+	avg_reward = np.load(filename_reward)
+	print("---------------------------------------")
+	print(f"avg reward:", avg_reward, "D4RL score:", d4rl_score)
+	print("---------------------------------------")
+	
+	_, D4RL_evaluation_curve = plt.subplots()
+	D4RL_evaluation_curve.plot(d4rl_score)
+	plt.savefig('results/'+model+'d4rl_evaluation_score.png')
+	_, avg_reward_evaluation_curve = plt.subplots()
+	avg_reward_evaluation_curve.plot(avg_reward)
+	plt.savefig('results/'+model+'avg_reward_evaluation_score.png')
+
+	plt.close()
+
+def visualize_d4RL_policy(env_name):
+    env = gym.make(env_name)
+
+    seed = 0
+    # Set seeds
+    env.seed(seed)
+    env.action_space.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
+    replay_buffer.convert_D4RL(d4rl.qlearning_dataset(env))
+    mean,std = replay_buffer.normalize_states() 
+
+    dataset = env.get_dataset()
+    if 'infos/qpos' not in dataset:
+        raise ValueError('Only MuJoCo-based environments can be visualized')
+    qpos = dataset['infos/qpos']
+    qvel = dataset['infos/qvel']
+    rewards = dataset['rewards']
+    actions = dataset['actions']
+
+    env.reset()
+    env.set_state(qpos[0], qvel[0])
+    for t in range(qpos.shape[0]):
+        env.set_state(qpos[t], qvel[t])
+        env.render()
 ##################################################### Functions ############################################################
 def update_cueballpos(prev_pos, velocity):
     dt = 0.0111
     new_pos = prev_pos + velocity*dt
     return new_pos
 
-def update_cuepos(prev_pos_front, prev_pos_back, velocity):
+def update_cuepos(prev_pos_front, actions): #, vel
     dt = 0.0111
-    new_pos_front = prev_pos_front + velocity*dt
-    new_pos_back = prev_pos_back + velocity*dt
-    return new_pos_front, new_pos_back
+    len_cue_stick = 1.21	#fixed value approximate over all subjects and trials, but not important to be precise, just for visualisation
+    
+    #acceleration = actions[10:]
+    #acceleration = acceleration*(158.1916216216216)
+    #new_vel = vel + acceleration*dt 
+
+    new_vel = actions[1:]
+    angle = actions[0]*(135 - 45)+45
+    angle_complementary = 180-angle
+    new_pos_front = prev_pos_front + new_vel*dt
+    new_pos_back = [new_pos_front[0] + len_cue_stick*np.cos(np.radians(-angle_complementary)),0, new_pos_front[2] + len_cue_stick*np.sin(np.radians(-angle_complementary))]   #0 on y 
+    return new_pos_front, new_pos_back	#, new_vel
 
 def compute_reward_evaluation(cuevel, target_corner, reward):
     target_corner_angle = np.rad2deg(np.arctan2(target_corner[1], target_corner[0]))
@@ -51,8 +135,8 @@ def compute_reward_evaluation(cuevel, target_corner, reward):
     if target_corner_angle < 90.0:
         angle = 180 - angle
     mean_pocket = 105.0736
-    lbPocket = mean_pocket - 0.3106383 #= 104.7629617
-    ubPocket = mean_pocket + 0.2543617 #= 105.3279617
+    lbPocket = mean_pocket - 1	#0.3106383 #= 104.7629617
+    ubPocket = mean_pocket + 1	#0.2543617 #= 105.3279617
 
     if reward == 100:
         reward = 100
@@ -67,9 +151,29 @@ def compute_reward_evaluation(cuevel, target_corner, reward):
 
 def weighted_sample(dic,prob_dist):
     ind = np.random.choice(dic['trial'][dic['terminals'] == True],p=prob_dist)
-    return (torch.FloatTensor(dic['states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['actions'][dic['trial'] == ind].to_numpy()).to(device), 
-            torch.FloatTensor(dic['new_states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['rewards'][dic['trial'] == ind].to_numpy()).to(device), 
-            torch.from_numpy(dic['terminals'][dic['trial'] == ind].to_numpy(dtype=bool)).to(device))
+    ind2 = np.random.choice(dic['trial'][dic['terminals'] == True],p=prob_dist)
+    ind3 = np.random.choice(dic['trial'][dic['terminals'] == True],p=prob_dist)
+    ind4 = np.random.choice(dic['trial'][dic['terminals'] == True],p=prob_dist)
+
+    mask1 = dic['trial'] == ind
+    mask2 = dic['trial'] == ind2
+    mask3 = dic['trial'] == ind3
+    mask4 = dic['trial'] == ind4
+
+    mask = mask1+mask2+mask3+mask4
+    return (torch.FloatTensor(dic['states'][mask].to_numpy()).to(device), torch.FloatTensor(dic['actions'][mask].to_numpy()).to(device), 
+            torch.FloatTensor(dic['new_states'][mask].to_numpy()).to(device), torch.FloatTensor(dic['rewards'][mask].to_numpy()).to(device), 
+            torch.from_numpy(dic['terminals'][mask].to_numpy(dtype=bool)).to(device))
+
+
+def weighted_sample_experience(dic, sample_size):
+	ind = []
+	for i in range(sample_size):
+		ind = np.append(ind, np.random.choice(dic['trial'].index))
+
+	return (torch.FloatTensor(dic['states'].iloc[ind].to_numpy()).to(device), torch.FloatTensor(dic['actions'].iloc[ind].to_numpy()).to(device), 
+            torch.FloatTensor(dic['new_states'].iloc[ind].to_numpy()).to(device), torch.FloatTensor(dic['rewards'].iloc[ind].to_numpy()).to(device), 
+            torch.from_numpy(dic['terminals'].iloc[ind].to_numpy(dtype=bool)).to(device))
 
 def sample(dic):
     ind = np.random.choice(dic['trial'].unique())
@@ -105,12 +209,12 @@ def load_clean_data(filename):
 	trial = df['trial'].astype(int)
 	terminals = df['terminals'].astype(bool)
 	#Train/Test split
-	trial_clean = np.concatenate((trial.unique()[0:75],trial.unique()[224:]))
-	trial_ind = np.arange(0,100)	#select only block 1,2.3 and 10 #1,len(trial.unique()) +1 if we want 250 index as well
+	trial_clean = np.concatenate((trial.unique()[0:75],trial.unique()[225:]))
+	print(filename[0], "len trial: ", len(trial_clean))
+	trial_ind = np.arange(0,len(trial_clean))	#select only block 1,2.3 and 10 #1,len(trial.unique()) +1 if we want 250 index as well
 	train_trial_ind = np.random.choice(trial_ind, size=int(0.8*len(trial_ind)), replace=False)  #distrib proba for each value, could be useful to weight more "important" trajectories
 	
 	test_trial_ind = np.delete(trial_ind, train_trial_ind)
-	print(filename[0], " size: ", trial_clean[train_trial_ind].shape)
 	train_trial = trial_clean[train_trial_ind]	
 	test_trial = trial_clean[test_trial_ind]
 
@@ -147,14 +251,11 @@ def load_clean_data(filename):
 				terminals = df['terminals'].astype(bool)
 				#Train/Test split
 
-				print(trial.unique()[0:75].shape,trial.unique()[224:])
-				trial_clean = np.concatenate((trial.unique()[0:75],trial.unique()[224:]))
-				trial_ind = np.arange(0,100)	#select only block 2 and 3 #1,len(trial.unique()) +1 if we want 250 index as well
+				trial_clean = np.concatenate((trial.unique()[0:75],trial.unique()[225:]))
+				print(file, "len trial: ", len(trial_clean))
+				trial_ind = np.arange(0,len(trial_clean))	#select only block 2 and 3 #1,len(trial.unique()) +1 if we want 250 index as well
 				train_trial_ind = np.random.choice(trial_ind, size=int(0.8*len(trial_ind)), replace=False)  #distrib proba for each value, could be useful to weight more "important" trajectories
 				
-				#train_trial = trial_clean[train_trial_ind]
-				print(file, trial_clean.shape, train_trial_ind.shape)
-				print(" size in for loop: ", trial_clean[train_trial_ind].shape)
 				test_trial_ind = np.delete(trial_ind, train_trial_ind)
 				train_trial = trial_clean[train_trial_ind]
 				test_trial = trial_clean[test_trial_ind]
@@ -272,8 +373,8 @@ class Actor(nn.Module):
 		self.l2 = nn.Linear(256, 256)	#nn.Linear(256, 512)
 		self.l3 = nn.Linear(256, action_dim)	#nn.Linear(512, 256)
 		#self.l4 = nn.Linear(256, action_dim)
-		self.actions_upper_bound = torch.tensor([135,1,1])
-		self.actions_lower_bound = torch.tensor([45,-1,-1])
+		self.actions_upper_bound = torch.tensor([1,1,1,1,1,1,1,1,0.2,1])#,1,1])    #135
+		self.actions_lower_bound = torch.tensor([0,0,0,0,0,0,-1,-1,-0.2,-1])#,-1,-1])  #45
 		self.max_action = max_action
 		
 
@@ -282,8 +383,8 @@ class Actor(nn.Module):
 		a = F.relu(self.l2(a))
 		#a = F.relu(self.l3(a))
 		a = torch.tanh(self.l3(a))
-		rescaled_actions = self.actions_lower_bound + (self.actions_upper_bound - self.actions_lower_bound) * (a + 1) / 2
-		return 	rescaled_actions #torch.tanh(self.l4(a))
+		#rescaled_actions = self.actions_lower_bound + (self.actions_upper_bound - self.actions_lower_bound) * (a + 1) / 2
+		return 	a	#rescaled_actions #torch.tanh(self.l4(a))
 
 class Critic(nn.Module):
 	def __init__(self, state_dim, action_dim):
@@ -342,10 +443,12 @@ class TD3_BC(object):
 		self.actor = Actor(state_dim, action_dim, max_action).to(device)
 		self.actor_target = copy.deepcopy(self.actor)
 		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
+		self.actor_scheduler = torch.optim.lr_scheduler.StepLR(self.actor_optimizer, step_size=10000, gamma=8e-5)
 
 		self.critic = Critic(state_dim, action_dim).to(device)
 		self.critic_target = copy.deepcopy(self.critic)
-		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
+		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)	
+		self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=10000, gamma=8e-5)
 
 		self.max_action = max_action
 		self.discount = discount
@@ -363,12 +466,14 @@ class TD3_BC(object):
 		return self.actor(state)	#.cpu().data.numpy().flatten()
 
 
-	def train(self, trajectory, batch_size=1):
+	def train(self, experience, batch_size=1):
 		self.total_it += 1
 		a_loss = 0.0
 		c_loss = 0.0
 		# Sample replay buffer 
-		states, actions, new_states, rewards, terminals = trajectory
+		#states, actions, new_states, rewards, not_terminals = trajectory.sample(256)
+		states, actions, new_states, rewards, terminals = experience #size 4*140=560
+
 		not_terminals = ~terminals#.reshape(-1,1)
 		#rewards = rewards.reshape(-1,1)
         #not_done = np.invert(terminals)
@@ -386,13 +491,12 @@ class TD3_BC(object):
 				target_Q1, target_Q2 = self.critic_target(new_states[i:i+batch_size][:], next_action)
 				target_Q = torch.min(target_Q1, target_Q2)
 				target_Q = rewards[i:i+batch_size] + not_terminals[i:i+batch_size] * self.discount * target_Q.squeeze()
-	
+
 			# Get current Q estimates
 			#print(states[i:i+batch_size][:].shape, actions[i:i+batch_size][:].shape)
 			current_Q1, current_Q2 = self.critic(states[i:i+batch_size][:], actions[i:i+batch_size][:])	#.reshape(-1,1))#Warning when action shape is 1
-			
 			# Compute critic loss
-			critic_loss = F.mse_loss(current_Q1.squeeze(), target_Q.squeeze()) + F.mse_loss(current_Q2.squeeze(), target_Q.squeeze())
+			critic_loss = F.mse_loss(current_Q1.squeeze(), target_Q) + F.mse_loss(current_Q2.squeeze(), target_Q)
 
 			#if (self.total_it) % 5 == 0:
 				#print("iteration ", self.total_it, " critic_loss: ", critic_loss)
@@ -410,7 +514,7 @@ class TD3_BC(object):
 				Q = self.critic.Q1(states[i:i+batch_size][:], pi)
 				lmbda = self.alpha/Q.abs().mean().detach()
 
-				actor_loss = -lmbda * Q.mean() + F.mse_loss(pi, actions[i:i+batch_size][:])
+				actor_loss = F.mse_loss(pi, actions[i:i+batch_size][:]) # -lmbda * Q.mean() +
 				# Optimize the actor 
 				self.actor_optimizer.zero_grad()
 				actor_loss.backward()
@@ -445,7 +549,6 @@ class TD3_BC(object):
 
 ################################################## CQL Agent ###############################################################
 
-
 '''
 from collections import OrderedDict
 from copy import deepcopy
@@ -458,7 +561,6 @@ import torch.optim as optim
 from torch import nn as nn
 import torch.nn.functional as F
 
-from .utils import prefix_metrics
 
 ########## Utility Functions ############
 class FullyConnectedNetwork(nn.Module):
@@ -895,7 +997,7 @@ FLAGS_DEF = define_flags_with_default(
     eval_n_trajs=5,
 
     cql=ConservativeSAC.get_default_config(),
-    logging=WandBLogger.get_default_config(),
+    #logging=WandBLogger.get_default_config(),
 )
 
 ################## Policy Definition ###########################
@@ -903,9 +1005,7 @@ FLAGS_DEF = define_flags_with_default(
 def CQLSAC():
 	FLAGS = absl.flags.FLAGS
 	eval_sampler = dataset
-	policy = TanhGaussianPolicy(
-		eval_sampler.env.observation_space.shape[0],
-		eval_sampler.env.action_space.shape[0],
+	policy = TanhGaussianPolicy(14,2,   #eval_sampler.env.observation_space.shape[0],eval_sampler.env.action_space.shape[0]
 		arch=FLAGS.policy_arch,
 		log_std_multiplier=FLAGS.policy_log_std_multiplier,
 		log_std_offset=FLAGS.policy_log_std_offset,
@@ -935,10 +1035,10 @@ def CQLSAC():
 	sac.torch_to_device(FLAGS.device)
 
 	sampler_policy = SamplerPolicy(policy, FLAGS.device)
+'''
 
-'''
 #################################################################################################################################
-'''
+
 def hidden_init(layer):
     fan_in = layer.weight.data.size()[0]
     lim = 1. / np.sqrt(fan_in)
@@ -988,7 +1088,7 @@ class Actor_CQL(nn.Module):
         return action, log_prob
         
     
-    def get_action(self, state):
+    def select_action(self, state):
         """
         returns the action based on a squashed gaussian policy. That means the samples are obtained according to:
         a(s,e)= tanh(mu(s)+sigma(s)+e)
@@ -998,7 +1098,7 @@ class Actor_CQL(nn.Module):
         dist = Normal(mu, std)
         e = dist.rsample().to(state.device)
         action = torch.tanh(e)
-        return action.detach().cpu()
+        return action#.detach().cpu()
     
     def get_det_action(self, state):
         mu, log_std = self.forward(state)
@@ -1061,7 +1161,7 @@ class CQLSAC(nn.Module):
         self.gamma = 0.99
         self.tau = 1e-2
         hidden_size = 256
-        learning_rate = 5e-4
+        learning_rate = 6e-5  
         self.clip_grad_param = 1
 
         self.target_entropy = -action_size  # -dim(A)
@@ -1100,16 +1200,16 @@ class CQLSAC(nn.Module):
         self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=learning_rate) 
 
     
-    def get_action(self, state, eval=False):
+    def select_action(self, state, eval=False):
         """Returns actions for given state as per current policy."""
-        state = torch.from_numpy(state).float().to(self.device)
+        #state = torch.from_numpy(state).float().to(self.device)
         
         with torch.no_grad():
             if eval:
                 action = self.actor_local.get_det_action(state)
             else:
-                action = self.actor_local.get_action(state)
-        return action.numpy()
+                action = self.actor_local.select_action(state)
+        return action	#.detach().numpy()
 
     def calc_policy_loss(self, states, alpha):
         actions_pred, log_pis = self.actor_local.evaluate(states)
@@ -1147,7 +1247,9 @@ class CQLSAC(nn.Module):
             experiences (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples 
             gamma (float): discount factor
         """
-        states, actions, rewards, next_states, dones = experiences
+        # Sample replay buffer 
+        #states, actions, next_states, rewards, not_dones = experiences.sample(512)
+        states, actions, next_states, rewards, dones = experiences
         not_dones = ~ dones
         actor_losses_ = []
         alpha_losses_ = []
@@ -1179,39 +1281,39 @@ class CQLSAC(nn.Module):
                 Q_target2_next = self.critic2_target(next_states[i:i+batch_size][:], next_action)
                 Q_target_next = torch.min(Q_target1_next, Q_target2_next) - self.alpha.to(self.device) * new_log_pi
                 # Compute Q targets for current states (y_i)
-                Q_targets = rewards + (self.gamma * not_dones[i:i+batch_size][:] * Q_target_next) 
+                Q_targets = rewards[i:i+batch_size] + not_dones[i:i+batch_size] * self.gamma * Q_target_next.squeeze()
 
 
             # Compute critic loss
             q1 = self.critic1(states[i:i+batch_size][:], actions[i:i+batch_size][:])
             q2 = self.critic2(states[i:i+batch_size][:], actions[i:i+batch_size][:])
 
-            critic1_loss = F.mse_loss(q1, Q_targets)
-            critic2_loss = F.mse_loss(q2, Q_targets)
+            critic1_loss = F.mse_loss(q1.squeeze(), Q_targets)
+            critic2_loss = F.mse_loss(q2.squeeze(), Q_targets)
             
             # CQL addon
-            random_actions = torch.FloatTensor(q1.shape[0] * 10, actions.shape[-1]).uniform_(-1, 1).to(self.device)
-            num_repeat = int (random_actions.shape[0] / states.shape[0])
-            temp_states = states.unsqueeze(1).repeat(1, num_repeat, 1).view(states.shape[0] * num_repeat, states.shape[1])
-            temp_next_states = next_states.unsqueeze(1).repeat(1, num_repeat, 1).view(next_states.shape[0] * num_repeat, next_states.shape[1])
+            random_actions = torch.FloatTensor(q1.shape[0] * 10, actions[i:i+batch_size][:].shape[-1]).uniform_(-1, 1).to(self.device)
+            num_repeat = int (random_actions.shape[0] / states[i:i+batch_size][:].shape[0])
+            temp_states = states[i:i+batch_size][:].unsqueeze(1).repeat(1, num_repeat, 1).view(states[i:i+batch_size][:].shape[0] * num_repeat, states[i:i+batch_size][:].shape[1])
+            temp_next_states = next_states[i:i+batch_size][:].unsqueeze(1).repeat(1, num_repeat, 1).view(next_states[i:i+batch_size][:].shape[0] * num_repeat, next_states[i:i+batch_size][:].shape[1])
             
             current_pi_values1, current_pi_values2  = self._compute_policy_values(temp_states, temp_states)
             next_pi_values1, next_pi_values2 = self._compute_policy_values(temp_next_states, temp_states)
             
-            random_values1 = self._compute_random_values(temp_states, random_actions, self.critic1).reshape(states.shape[0], num_repeat, 1)
-            random_values2 = self._compute_random_values(temp_states, random_actions, self.critic2).reshape(states.shape[0], num_repeat, 1)
+            random_values1 = self._compute_random_values(temp_states, random_actions, self.critic1).reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
+            random_values2 = self._compute_random_values(temp_states, random_actions, self.critic2).reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
             
-            current_pi_values1 = current_pi_values1.reshape(states.shape[0], num_repeat, 1)
-            current_pi_values2 = current_pi_values2.reshape(states.shape[0], num_repeat, 1)
+            current_pi_values1 = current_pi_values1.reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
+            current_pi_values2 = current_pi_values2.reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
 
-            next_pi_values1 = next_pi_values1.reshape(states.shape[0], num_repeat, 1)
-            next_pi_values2 = next_pi_values2.reshape(states.shape[0], num_repeat, 1)
+            next_pi_values1 = next_pi_values1.reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
+            next_pi_values2 = next_pi_values2.reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
             
             cat_q1 = torch.cat([random_values1, current_pi_values1, next_pi_values1], 1)
             cat_q2 = torch.cat([random_values2, current_pi_values2, next_pi_values2], 1)
             
-            assert cat_q1.shape == (states.shape[0], 3 * num_repeat, 1), f"cat_q1 instead has shape: {cat_q1.shape}"
-            assert cat_q2.shape == (states.shape[0], 3 * num_repeat, 1), f"cat_q2 instead has shape: {cat_q2.shape}"
+            assert cat_q1.shape == (states[i:i+batch_size][:].shape[0], 3 * num_repeat, 1), f"cat_q1 instead has shape: {cat_q1.shape}"
+            assert cat_q2.shape == (states[i:i+batch_size][:].shape[0], 3 * num_repeat, 1), f"cat_q2 instead has shape: {cat_q2.shape}"
             
 
             cql1_scaled_loss = ((torch.logsumexp(cat_q1 / self.temp, dim=1).mean() * self.cql_weight * self.temp) - q1.mean()) * self.cql_weight
@@ -1271,8 +1373,27 @@ class CQLSAC(nn.Module):
         """
         for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
             target_param.data.copy_(self.tau*local_param.data + (1.0-self.tau)*target_param.data)
-'''
 
+    def save(self, filename):
+        torch.save(self.critic1.state_dict(), filename + "_critic1")	
+        torch.save(self.critic1_optimizer.state_dict(), filename + "_critic1_optimizer")
+        torch.save(self.critic2.state_dict(), filename + "_critic2")	
+        torch.save(self.critic2_optimizer.state_dict(), filename + "_critic2_optimizer")
+
+        torch.save(self.actor_local.state_dict(), filename + "_actor")
+        torch.save(self.actor_optimizer.state_dict(), filename + "_actor_optimizer")
+
+    def load(self, filename):
+        self.critic1.load_state_dict(torch.load(filename + "_critic1"))
+        self.critic1_optimizer.load_state_dict(torch.load(filename + "_critic1_optimizer"))
+        self.critic1_target = copy.deepcopy(self.critic)
+        self.critic2.load_state_dict(torch.load(filename + "_critic12"))
+        self.critic2_optimizer.load_state_dict(torch.load(filename + "_critic2_optimizer"))
+        self.critic2_target = copy.deepcopy(self.critic2)
+
+        self.actor_local.load_state_dict(torch.load(filename + "_actor"))
+        self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
+        self.actor_target = copy.deepcopy(self.actor_local)
 '''
 class Actor_CQL(nn.Module):
     """Actor (Policy) Model."""
@@ -1850,7 +1971,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
         "save_model": "store_true",
         "load_model": "",                 # Model load file name, "" doesn't load, "default" uses file_name
         # TD3
-        "expl_noise": 0.3,
+        "expl_noise": 0.1,
         "batch_size": 256,
         "discount": 0.99,
         "tau": 0.005,
@@ -1858,7 +1979,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
         "noise_clip": 0.5,
         "policy_freq": 2,
         # TD3 + BC
-        "alpha": 3.,#2.5
+        "alpha": 2.5,
         "normalize": True,
         "state_dim": 14,
         "action_dim": 3,
@@ -1885,26 +2006,67 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 		# Initialize Agent
 		policy = CQLSAC(state_dim,action_dim)
 		print("---------------------------------------")
-		print(f"Policy: {args['policy']}")
+		print(f"Policy: {model}")
 		print("---------------------------------------")
 		if train == True:
 			alpha_losses = []
 			critic1_losses = []
 			critic2_losses = []
 			policy_losses = []
+			evaluation_losses = []
+            
+			trajectory_rewards = dataset['rewards'][dataset['terminals']]
 
+			prob_dist = np.ones(len(trajectory_rewards))	#len(dataset['trial'].unique())-10)#-1 Because last trial has no terminal state (to be changed in future)
+
+			prob_dist[trajectory_rewards != -10.0] = 50	#500 times higher probs than other traj to be sampled
+			prob_dist = prob_dist/prob_dist.sum()
+
+			'''############# D4RL #############
+			evaluations=[]
+			evaluations2=[]
+			env_name = "hopper-medium-v0"
+			env = gym.make(env_name)
+			seed = 0
+			# Set seeds
+			env.seed(seed)
+			env.action_space.seed(seed)
+			torch.manual_seed(seed)
+			np.random.seed(seed)
+
+			replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
+			replay_buffer.convert_D4RL(d4rl.qlearning_dataset(env))
+			mean,std = replay_buffer.normalize_states() 
+			############# D4RL #############'''
+			
 			for i in tqdm(range(1, epochs)):
-				trajectory = sample(dataset)	#weighted_sample(dataset, prob_dist)
-				#trajectory = sample(dataset)
-				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(trajectory, batch_size = 32)  #, current_alpha, cql_alpha_loss, cql_alpha 
-				print("alpha loss: ", alpha_loss)
+				trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
+				
+				#actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(replay_buffer, batch_size = 512)  #trajectory #, current_alpha, cql_alpha_loss, cql_alpha 
+				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(trajectory, batch_size = 140)
 				alpha_losses.append(alpha_loss)
-				critic1_losses.append(critic1_loss + cql1_scaled_loss)
-				critic2_losses.append(critic2_loss + cql2_scaled_loss)
+				critic1_losses.append(critic1_loss) # + cql1_scaled_loss)
+				critic2_losses.append(critic2_loss) # + cql2_scaled_loss)
 				policy_losses.append(actor_loss)
 				
-				#if i%10 == 0:
-					#policy.save("models/CQL_SAC_policy")
+				'''if i%1000==0:
+					avg_reward, d4rl_score = eval_policy(policy, env_name, 0, mean, std)
+					evaluations.append(avg_reward)
+					evaluations2.append(d4rl_score)
+					np.save(f"results/"+env_name+"_CQL_avg_reward", evaluations)
+					np.save(f"results/"+env_name+"_CQL_d4rl_score", evaluations2)
+
+				if i%3000==0:
+					policy.save("models/D4RL/CQL_policy")
+				'''
+				if i%2000 == 0:
+					plot_3D_animated_learnt_policy(train_set, policy,"CQL_SAC",  i)
+				if i%1000 == 0:
+					#evaluate_agent_performance(test_set, policy)
+					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "CQL_SAC",i , action_dim=action_dim)
+					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
+					policy.save("models/CQL_SAC/CQL_SAC_policy")
+			
 			_, alpha_loss_curve = plt.subplots()
 			alpha_loss_curve.plot(alpha_losses)
 			plt.savefig('training_plots/CQL_SAC/alpha_losses_training_curve.png')
@@ -1920,18 +2082,25 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			_, policy_loss_curve = plt.subplots()
 			policy_loss_curve.plot(policy_losses)
 			plt.savefig('training_plots/CQL_SAC/policy_losses_training_curve.png')
-	
+
+			_, evaluation_loss_curve = plt.subplots()
+			evaluation_loss_curve.plot(evaluation_losses)
+			plt.savefig('training_plots/CQL_SAC/evaluation_losses_during_training.png')
+
+		else:
+			print("load trained model")
+			policy.load("models/CQL_SAC/CQL_SAC_policy")
+
 	elif model == "TD3_BC":
 		# Initialize Agent
 		policy = TD3_BC(**kwargs) 
 		print("---------------------------------------")
-		print(f"Policy: {args['policy']}")	#, Seed: {args['seed']}")
+		print(f"Policy: {model}")	#, Seed: {args['seed']}")
 		print("---------------------------------------")
 		if train == True:
 			a_losses = []
 			c_losses = []
 			evaluation_losses = []
-
 			
 			trajectory_rewards = dataset['rewards'][dataset['terminals']]
 
@@ -1940,24 +2109,53 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			prob_dist[trajectory_rewards != -10.0] = 50	#500 times higher probs than other traj to be sampled
 			prob_dist = prob_dist/prob_dist.sum()
 			
-			for i in tqdm(range(1, epochs)):
-				trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 	   
+			
+			'''############# D4RL #############
+			evaluations = []
+			evaluations2 = []
+			env_name = "hopper-medium-v0"
+			env = gym.make(env_name)
+			seed = 0
+			# Set seeds
+			env.seed(seed)
+			env.action_space.seed(seed)
+			torch.manual_seed(seed)
+			np.random.seed(seed)
 
-				#trajectory = sample(dataset)
-				c_loss, a_loss = policy.train(trajectory, batch_size = 256)	#, args, **kwargs
+			replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
+			replay_buffer.convert_D4RL(d4rl.qlearning_dataset(env))
+			mean,std = replay_buffer.normalize_states() 
+			############# D4RL #############'''
+
+			for i in tqdm(range(1, epochs)):
+				experience = weighted_sample_experience(dataset, sample_size=560)    #weighted_sample(dataset, prob_dist) #sample(dataset) 	   
+				states, actions, new_states, rewards, terminals = experience
+				print("experience shape: ", states.shape, actions.shape)
+				c_loss, a_loss = policy.train(experience, batch_size = 140) #replay_buffer #, args, **kwargs
 				if a_loss != 0.0:	#actor loss updated only once every "policy_freq" update, set to 0 otherwise
 					a_losses.append(a_loss)
 				c_losses.append(c_loss)
+				'''if i%1000==0:
+					avg_reward, d4rl_score = eval_policy(policy, env_name, 0, mean, std)
+					evaluations.append(avg_reward)
+					evaluations2.append(d4rl_score)
+					#np.save(f"results/"+env_name+"_TD3_avg_reward", evaluations)
+					#np.save(f"results/"+env_name+"_TD3_d4rl_score", evaluations2)
+				#if i%3000==0:
+					#policy.save("models/D4RL/TD3_BC_policy")'''
+                
+				if i%2 == 0:
+					#plot_animated_learnt_policy(test_set, policy,"TD3_BC",  i)
+					#plot_3D_animated_learnt_policy(train_set, policy,"TD3_BC",  i)
+					plot_action_animated_learnt_policy(train_set, policy,"TD3_BC",  i)
 
-				
-				if i%2000 == 0:
-					plot_animated_learnt_policy(test_set, policy, i)
-				
 				if i%1000 == 0:
 					#evaluate_agent_performance(test_set, policy)
-					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy,i)
+					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "TD3_BC",i, action_dim = action_dim)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
-					policy.save("models/TD3_BC_policy")
+					policy.save("models/TD3_BC/TD3_BC_policy")
+				policy.actor_scheduler.step()
+				policy.critic_scheduler.step()
 			
 			_, evaluation_loss_curve = plt.subplots()
 			evaluation_loss_curve.plot(evaluation_losses)
@@ -1972,7 +2170,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			plt.savefig('training_plots/TD3_BC/critic_losses_training_curve.png')
 		else:
 			print("load trained model")
-			policy.load("models/batch_size_256_non_weighted_sample/TD3_BC_policy")
+			policy.load("models/TD3_BC/TD3_BC_policy")
 	else:
 		print(model, "is not implemented")
 		policy=None
@@ -1981,38 +2179,44 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 def evaluate_agent_performance(dataset, policy):
 	rewards = []
 	rewards_human = []
+	radius = 0.005
+	vertical_margin = 0.01
 
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
 		states, actions, new_states, reward_, terminals= get_trajectory(dataset, trial)
 		
+		
+		states = states.detach().numpy()
 		state = states[0][:]
-		pi_e = policy.select_action(state)
+		pi_e = policy.select_action(state).detach().numpy()
 		cuevel = pi_e[1:]
-		state_cueball = state[0:2]
-		state_cue_front = state[8:10]
-		state_cue_back = state[10:12]
+		state_cueball = state[0:3]
+		state_cue_front = state[12:15]
+		state_cue_back = state[15:18]
 
 		reward_human = reward_[terminals == True]
-		reward = 0
-		for k in range(states.size(dim=0)):
+		reward = 0.0
+		for k in range(states.shape[0]):
 			#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-			next_state_cue_front, next_state_cue_back = update_cuepos(state_cue_front, state_cue_back, cuevel)
-			if (next_state_cue_front[0] - state_cueball[0]).pow(2) + (next_state_cue_front[1] - state_cueball[1]).pow(2) < 0.01:	#cue tip in cueball radius
-				#print("Cue stick entered radius")
+			next_state_cue_front, next_state_cue_back = update_cuepos(state_cue_front, pi_e)
+			if (next_state_cue_front[0] - state_cueball[0])**2 + (next_state_cue_front[2] - state_cueball[2])**2 < radius \
+			and next_state_cue_front[1] < state_cueball[1] + vertical_margin:
+				
 				next_state_cueball = update_cueballpos(state_cueball, cuevel)
-				states[k][0:2] = next_state_cueball
-				states[k][2:4] = cuevel
-				reward = compute_reward_evaluation(cuevel.detach().numpy(), state[6:8].detach().numpy(), reward)
-			states[k][8:10] = next_state_cue_front
-			states[k][10:12] = next_state_cue_back
-			pi_e = policy.select_action(states[k][:])
+				states[k][0:3] = next_state_cueball
+				reward = compute_reward_evaluation(cuevel, state[6:8], reward)
+			states[k][21:] = cuevel
+			states[k][12:15] = next_state_cue_front
+			states[k][15:18] = next_state_cue_back
+			pi_e = policy.select_action(states[k][:]).detach().numpy()
 			cuevel = pi_e[1:]
 		rewards = np.append(rewards, reward)
 		rewards_human = np.append(rewards_human, reward_human)
 	print("number of successful trials agent: ", np.count_nonzero(rewards), rewards)
-	print("number of successful trials human subject: ", np.count_nonzero(rewards_human), rewards_human)
+	print("number of successful trials human subject: ", np.count_nonzero(rewards_human+10), rewards_human)
 
-def evaluate_close_to_human_behaviour(dataset, policy, iteration):
+
+def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration=44, action_dim=3):
 	#losses = []
 	#avg_loss = 0.0
 
@@ -2046,105 +2250,106 @@ def evaluate_close_to_human_behaviour(dataset, policy, iteration):
 	vel_z_e_u_ = []
 
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
-		loss = 0.0
+		loss = torch.zeros([1,], dtype=torch.float64)
 		#states, actions, new_states, reward, terminals= sample(dataset)
 		#print("not terminals: ", terminals)
 		states, actions, new_states, reward, terminals= get_trajectory(dataset, trial)
-		if torch.any(terminals) == True:
-			if reward[terminals] != -10.0:
-				count_successful_trajectory += 1
-				successful_trajectory = np.append(successful_trajectory, i)
-				## loss
-				epoch_loss = np.zeros(states.size(dim=0))
-				## Actions Visualisation
-				behaviour_actions = np.zeros((states.size(dim=0),3))
-				agent_actions = np.zeros((states.size(dim=0),3))
-				angle_b = np.zeros((states.size(dim=0)))
-				vel_x_b = np.zeros((states.size(dim=0)))
-				vel_z_b = np.zeros((states.size(dim=0)))
-
-				angle_e = np.zeros((states.size(dim=0)))
-				vel_x_e = np.zeros((states.size(dim=0)))
-				vel_z_e = np.zeros((states.size(dim=0)))
-				## Actions Visualisation
-
-				for k in range(states.size(dim=0)):
-					#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-					pi_e = policy.select_action(states[k][:])
-					pi_b = actions[k][:]
-					#print("step ", k, pi_e, pi_b)
-					epoch_loss[k] = F.mse_loss(pi_e, pi_b)
-					loss += F.mse_loss(pi_e, pi_b)
-
+		if len(states) == 140:
+			if torch.any(terminals) == True:
+				if reward[terminals] != -10.0:
+					count_successful_trajectory += 1
+					successful_trajectory = np.append(successful_trajectory, i)
+					## loss
+					epoch_loss = np.zeros(states.size(dim=0))
 					## Actions Visualisation
-					angle_b[k] = pi_b[0].detach().numpy()
-					vel_x_b[k] = pi_b[1].detach().numpy()
-					vel_z_b[k] = pi_b[2].detach().numpy()
+					behaviour_actions = np.zeros((states.size(dim=0),action_dim))
+					agent_actions = np.zeros((states.size(dim=0),action_dim))
+					angle_b = np.zeros((states.size(dim=0)))
+					vel_x_b = np.zeros((states.size(dim=0)))
+					vel_z_b = np.zeros((states.size(dim=0)))
 
-					angle_e[k] = pi_e[0].detach().numpy()
-					vel_x_e[k] = pi_e[1].detach().numpy()
-					vel_z_e[k] = pi_e[2].detach().numpy()
-
-					behaviour_actions[k,:] = pi_b.detach().numpy()#[1]
-					agent_actions[k,:] = pi_e.detach().numpy()#[1]
-
-
-				angle_b_ = np.append(angle_b_, angle_b)
-				vel_x_b_ = np.append(vel_x_b_, vel_x_b)
-				vel_z_b_ = np.append(vel_z_b_, vel_z_b)
-
-				angle_e_ = np.append(angle_e_, angle_e)
-				vel_x_e_ = np.append(vel_x_e_, vel_x_e)
-				vel_z_e_ = np.append(vel_z_e_, vel_z_e)
-
-				epoch_loss_ = np.append(epoch_loss_ , epoch_loss)
-				#behaviour_actions_ = np.append(behaviour_actions_, behaviour_actions)
-				#agent_actions_ = np.append(agent_actions_, agent_actions)
-
-			
-			elif reward[terminals] == -10.0:
-				count_unsuccessful_trajectory += 1
-				unsuccessful_trajectory = np.append(unsuccessful_trajectory, i)
-				## loss
-				epoch_loss_u = np.zeros(states.size(dim=0))
-				## Actions Visualisation
-				angle_b_u = np.zeros((states.size(dim=0)))
-				vel_x_b_u = np.zeros((states.size(dim=0)))
-				vel_z_b_u = np.zeros((states.size(dim=0)))
-
-				angle_e_u = np.zeros((states.size(dim=0)))
-				vel_x_e_u = np.zeros((states.size(dim=0)))
-				vel_z_e_u = np.zeros((states.size(dim=0)))
-				## Actions Visualisation
-
-				for k in range(states.size(dim=0)):
-					#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-					pi_e_u = policy.select_action(states[k][:])
-					pi_b_u = actions[k][:]
-					epoch_loss_u[k] = F.mse_loss(pi_e_u, pi_b_u)
-					loss += F.mse_loss(pi_e_u, pi_b_u)
-
+					angle_e = np.zeros((states.size(dim=0)))
+					vel_x_e = np.zeros((states.size(dim=0)))
+					vel_z_e = np.zeros((states.size(dim=0)))
 					## Actions Visualisation
-					angle_b_u[k] = pi_b_u[0].detach().numpy()
-					vel_x_b_u[k] = pi_b_u[1].detach().numpy()
-					vel_z_b_u[k] = pi_b_u[2].detach().numpy()
 
-					angle_e_u[k] = pi_e_u[0].detach().numpy()
-					vel_x_e_u[k] = pi_e_u[1].detach().numpy()
-					vel_z_e_u[k] = pi_e_u[2].detach().numpy()
+					for k in range(states.size(dim=0)):
+						#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
+						pi_e = policy.select_action(states[k][:])
+						pi_b = actions[k][:]
+						#print("step ", k, pi_e, pi_b)
+						epoch_loss[k] = F.mse_loss(pi_e, pi_b)
+						loss += F.mse_loss(pi_e, pi_b)
+
+						## Actions Visualisation
+						angle_b[k] = pi_b[0].detach().numpy()
+						vel_x_b[k] = pi_b[1].detach().numpy()
+						vel_z_b[k] = pi_b[2].detach().numpy()#2
+
+						angle_e[k] = pi_e[0].detach().numpy()
+						vel_x_e[k] = pi_e[1].detach().numpy()
+						vel_z_e[k] = pi_e[2].detach().numpy()#2
+
+						behaviour_actions[k,:] = pi_b.detach().numpy()#[1]
+						agent_actions[k,:] = pi_e.detach().numpy()#[1]
 
 
-				angle_b_u_ = np.append(angle_b_u_, angle_b_u)
-				vel_x_b_u_ = np.append(vel_x_b_u_, vel_x_b_u)
-				vel_z_b_u_ = np.append(vel_z_b_u_, vel_z_b_u)
+					angle_b_ = np.append(angle_b_, angle_b)
+					vel_x_b_ = np.append(vel_x_b_, vel_x_b)
+					vel_z_b_ = np.append(vel_z_b_, vel_z_b)
 
-				angle_e_u_ = np.append(angle_e_u_, angle_e_u)
-				vel_x_e_u_ = np.append(vel_x_e_u_, vel_x_e_u)
-				vel_z_e_u_ = np.append(vel_z_e_u_, vel_z_e_u)
+					angle_e_ = np.append(angle_e_, angle_e)
+					vel_x_e_ = np.append(vel_x_e_, vel_x_e)
+					vel_z_e_ = np.append(vel_z_e_, vel_z_e)
 
-				epoch_loss_u_ = np.append(epoch_loss_u_ , epoch_loss_u)
-		else:
-			print("No terminal state in trial ", trial, terminals)
+					epoch_loss_ = np.append(epoch_loss_ , epoch_loss)
+					#behaviour_actions_ = np.append(behaviour_actions_, behaviour_actions)
+					#agent_actions_ = np.append(agent_actions_, agent_actions)
+
+				
+				elif reward[terminals] == -10.0:
+					count_unsuccessful_trajectory += 1
+					unsuccessful_trajectory = np.append(unsuccessful_trajectory, i)
+					## loss
+					epoch_loss_u = np.zeros(states.size(dim=0))
+					## Actions Visualisation
+					angle_b_u = np.zeros((states.size(dim=0)))
+					vel_x_b_u = np.zeros((states.size(dim=0)))
+					vel_z_b_u = np.zeros((states.size(dim=0)))
+
+					angle_e_u = np.zeros((states.size(dim=0)))
+					vel_x_e_u = np.zeros((states.size(dim=0)))
+					vel_z_e_u = np.zeros((states.size(dim=0)))
+					## Actions Visualisation
+
+					for k in range(states.size(dim=0)):
+						#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
+						pi_e_u = policy.select_action(states[k][:])
+						pi_b_u = actions[k][:]
+						epoch_loss_u[k] = F.mse_loss(pi_e_u, pi_b_u)
+						loss += F.mse_loss(pi_e_u, pi_b_u)
+
+						## Actions Visualisation
+						angle_b_u[k] = pi_b_u[0].detach().numpy()
+						vel_x_b_u[k] = pi_b_u[1].detach().numpy()
+						vel_z_b_u[k] = pi_b_u[2].detach().numpy()#2
+
+						angle_e_u[k] = pi_e_u[0].detach().numpy()
+						vel_x_e_u[k] = pi_e_u[1].detach().numpy()
+						vel_z_e_u[k] = pi_e_u[2].detach().numpy()#2
+
+
+					angle_b_u_ = np.append(angle_b_u_, angle_b_u)
+					vel_x_b_u_ = np.append(vel_x_b_u_, vel_x_b_u)
+					vel_z_b_u_ = np.append(vel_z_b_u_, vel_z_b_u)
+
+					angle_e_u_ = np.append(angle_e_u_, angle_e_u)
+					vel_x_e_u_ = np.append(vel_x_e_u_, vel_x_e_u)
+					vel_z_e_u_ = np.append(vel_z_e_u_, vel_z_e_u)
+
+					epoch_loss_u_ = np.append(epoch_loss_u_ , epoch_loss_u)
+			else:
+				print("No terminal state in trial ", trial, terminals)
 		## Actions Visualisation
 
 	#print("number of test trials: ", len(dataset['trial'].unique()), "count_unsuccessful_trajectory: ", count_unsuccessful_trajectory, "count_successful_trajectory: ", count_successful_trajectory)
@@ -2167,7 +2372,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, iteration):
 		mean_b.plot(X_u, angle_e_u_[i*140:(i+1)*140], color='red')
 	#mean_b.legend()
 	#fig.tight_layout()
-	fig.savefig('training_plots/TD3_BC/iter_'+str(iteration)+'_angle_behaviour_agent.png')
+	fig.savefig('training_plots/'+model+'/iter_'+str(iteration)+'_angle_behaviour_agent.png')
 
 	fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
@@ -2183,7 +2388,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, iteration):
 		mean_b.plot(X_u, vel_x_e_u_[i*140:(i+1)*140], color='red')
 	#mean_b.legend()
 	#fig.tight_layout()
-	fig.savefig('training_plots/TD3_BC/iter_'+str(iteration)+'_vel_x_behaviour_agent.png')
+	fig.savefig('training_plots/'+model+'/iter_'+str(iteration)+'_vel_x_behaviour_agent.png')
 
 	fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
@@ -2199,7 +2404,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, iteration):
 		mean_b.plot(X_u, vel_z_e_u_[i*140:(i+1)*140], color='red')
 	#mean_b.legend()
 	#fig.tight_layout()
-	fig.savefig('training_plots/TD3_BC/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')
+	fig.savefig('training_plots/'+model+'/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')
 
 	fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
@@ -2212,7 +2417,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, iteration):
 		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
 		mean_b.plot(X_u, epoch_loss_u_[i*140:(i+1)*140], color='red')
 	#fig.tight_layout()
-	fig.savefig('training_plots/TD3_BC/iter_'+str(iteration)+'_MSE_loss_between_actions.png')
+	fig.savefig('training_plots/'+model+'/iter_'+str(iteration)+'_MSE_loss_between_actions.png')
 
 	'''## Actions Visualisation
 	behaviour_actions_graph = np.zeros((count_successful_trajectory, 50))    
@@ -2262,13 +2467,13 @@ def evaluate_close_to_human_behaviour(dataset, policy, iteration):
 	ev_fig.savefig('training_plots/evaluation_losses.png')
 	avg_loss = sum(losses)/len(losses)
 	print("Average Evaluation loss: ", avg_loss)'''
-	plt.close()
+	plt.close('all')
 	return loss/len(dataset["trial"])
 
 def plot_animated_behaviour_policy(dataset):
 	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[0])
 	states = states.detach().numpy()
-
+	reward = dataset["rewards"].iloc[0]
 	fig, ax = plt.subplots(1,1)
 
 	def animate(i):
@@ -2283,7 +2488,13 @@ def plot_animated_behaviour_policy(dataset):
 		
 		ax.scatter(states[i][4], states[i][5], s=60, facecolors='red', edgecolors='red', label = 'target ball')
 		ax.scatter(states[i][6], states[i][7], s=400, facecolors='none', edgecolors='green', label = 'pocket')
+		
+		x_rew = 1
+		y_rew = 1
+		ax.scatter(x_rew,y_rew, s=60, facecolors='none', edgecolors='red', label = str(reward))
 		ax.set(xlim=(-2, 2), ylim=(-2, 2))
+
+
 		ax.legend()
 
 
@@ -2292,7 +2503,7 @@ def plot_animated_behaviour_policy(dataset):
 	anim.save('training_plots/Agent_policy3.gif', writer='imagemagick')	
 	print("saved GIF")
 
-def plot_animated_learnt_policy(dataset, policy, iteration=44):
+def plot_animated_learnt_policy(dataset, policy, model="TD3_BC", iteration=44):
 
 	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[31])
 	states = states.detach().numpy()
@@ -2314,6 +2525,8 @@ def plot_animated_learnt_policy(dataset, policy, iteration=44):
 	fig.savefig('training_plots/actions.png')
 	plt.close()'''
 
+	ref_cueposfront = [states[:,8:10]]
+	ref_cueposback = [states[:,10:12]]
 	cueposfront = np.zeros((states.shape[0],2))
 	cueposback = np.zeros((states.shape[0],2))
 	cueposfront[0][0] = states[0,8]
@@ -2322,11 +2535,10 @@ def plot_animated_learnt_policy(dataset, policy, iteration=44):
 	cueposback[0][1] = states[0,11]
 	actions = policy.select_action(states[0,:]).detach().numpy()
 
-	dt = 0.0111
-	for i in range(1, actions.shape[0]-1):
-		#cueposfront[i][:], cueposback[i][:] = update_cuepos(cueposfront[i-1][:], cueposback[i-1][:], cuevel[i][:])
-		cueposfront[i][:] = cueposfront[i-1][:] + actions[1:]*dt
-		cueposback[i][:] = cueposback[i-1][:] + actions[1:]*dt
+	for i in range(1, states.shape[0]-1):
+		cueposfront[i][:], cueposback[i][:] = update_cuepos(cueposfront[i-1][:], cueposback[i-1][:], actions)
+		#cueposfront[i][:] = cueposfront[i-1][:] + actions[1:]*dt
+		#cueposback[i][:] = cueposback[i-1][:] + actions[1:]*dt
 		#update states
 		states[i,8] = cueposfront[i][0]
 		states[i,9] = cueposfront[i][1]
@@ -2334,12 +2546,21 @@ def plot_animated_learnt_policy(dataset, policy, iteration=44):
 		states[i,11] = cueposback[i][1]
 		actions = policy.select_action(states[i,:]).detach().numpy()
 
+	#actions = policy.select_action(states).detach().numpy()
+	#cueposfront = actions[:,1:3]
+	#cueposback = actions[:,3:5]
+
 	cueballpos = np.zeros((states.shape[0],2))
 	cueballpos[0][0] = states[0][0]
 	cueballpos[0][1] = states[0][1]
-
+	
 	def animate(i):
 		ax.clear()
+		x_ref = [ref_cueposback[i,0], ref_cueposfront[i,0]]
+		z_ref = [ref_cueposback[i,1], ref_cueposfront[i,1]]
+		ax.plot(x_ref, z_ref, color="green", label = 'reference stick')
+
+
 		#x_values = [states[i,10], states[i,8]]
 		x_values = [cueposback[i][0], cueposfront[i][0]]
 		#z_values = [states[i,11], states[i,9]]
@@ -2362,26 +2583,188 @@ def plot_animated_learnt_policy(dataset, policy, iteration=44):
 
 	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=20, repeat=False)	
 	plt.close()
-	anim.save('training_plots/TD3_BC/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')	
+	anim.save('training_plots/'+model+'/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')	
 	#print("saved GIF")
+
+def plot_3D_animated_learnt_policy(dataset, policy, model="TD3_BC", iteration=44):
+
+	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[iteration])
+	states = states#.detach().numpy()
+	fig, ax = plt.subplots(1,1)
+	ref_cueposfront = states[:,12:15].clone().detach()
+	ref_cueposback = states[:,15:18].clone().detach()
+	cueposfront = np.zeros((states.shape[0],3))
+	cueposback = np.zeros((states.shape[0],3))
+	cueposfront[0][0] = states[0,12]
+	cueposfront[0][1] = states[0,13]
+	cueposfront[0][2] = states[0,14]
+	cueposback[0][0] = states[0,15]
+	cueposback[0][1] = states[0,16]
+	cueposback[0][2] = states[0,17]
+	actions = policy.select_action(states[0,:]).detach().numpy()
+	 
+	for i in range(1, states.shape[0]-1):
+		cueposfront[i][:] = actions[0:3]	#[1:4]
+		cueposback[i][:] = actions[3:6]	#[4:7]
+		#cueposfront[i][:], cueposback[i][:] = update_cuepos(cueposfront[i-1][:], cueposback[i-1][:], actions)
+		#cueposfront[i][:] = cueposfront[i-1][:] + actions[1:]*dt
+		#cueposback[i][:] = cueposback[i-1][:] + actions[1:]*dt
+		#update states
+		states[i,12] = cueposfront[i][0]
+		states[i,13] = cueposfront[i][1]
+		states[i,14] = cueposfront[i][2]
+		states[i,15] = cueposback[i][0]
+		states[i,16] = cueposback[i][1]
+		states[i,17] = cueposback[i][2]
+		actions = policy.select_action(states[i,:]).detach().numpy()
+
+	#actions = policy.select_action(states).detach().numpy()
+	#cueposfront = actions[:,1:3]
+	#cueposback = actions[:,3:5]
+
+	cueballpos = np.zeros((states.shape[0],2))
+	cueballpos[0][0] = states[0][0]
+	cueballpos[0][1] = states[0][1]
+	
+	def animate(i):
+		ax.clear()
+		x_ref = [ref_cueposback[i,0], ref_cueposfront[i,0]]
+		z_ref = [ref_cueposback[i,2], ref_cueposfront[i,2]]
+		ax.plot(x_ref, z_ref, color="green", label = 'reference stick')
+
+
+		x_values = [cueposback[i][0], cueposfront[i][0]]
+		z_values = [cueposback[i][2], cueposfront[i][2]]
+		ax.plot(x_values, z_values, color="blue", label = 'cue stick')
+
+		x_val = states[i,0]	
+		z_val = states[i,2]
+		ax.scatter(x_val, z_val, s=60, facecolors='black', edgecolors='black', label = 'cueball')
+		
+		ax.scatter(states[i][6], states[i][8], s=60, facecolors='red', edgecolors='red', label = 'target ball')
+		ax.scatter(states[i][9], states[i][11], s=400, facecolors='none', edgecolors='green', label = 'pocket')
+		ax.set(xlim=(-1, 1), ylim=(-2, 2))
+		ax.legend()
+
+
+	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=40, repeat=False)	
+	plt.close()
+	anim.save('training_plots/'+model+'/iter_'+str(iteration)+'_3D_Agent_learnt_policy.gif', writer='imagemagick')	
+
+def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteration=44):
+
+	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[iteration])
+	states = states#.detach().numpy()
+	fig, ax = plt.subplots(1,1)
+	ref_cueposfront = states[:,12:15].clone().detach()
+	ref_cueposback = states[:,15:18].clone().detach()
+	cueposfront = np.zeros((states.shape[0],3))
+	cueposback = np.zeros((states.shape[0],3))
+	cueposfront[0][0] = states[0,12]
+	cueposfront[0][1] = states[0,13]
+	cueposfront[0][2] = states[0,14]
+	cueposback[0][0] = states[0,15]
+	cueposback[0][1] = states[0,16]
+	cueposback[0][2] = states[0,17]
+
+	'''cueposfront2 = np.zeros((states.shape[0],3))
+	cueposback2 = np.zeros((states.shape[0],3))
+	cueposfront2[0][0] = states[0,12]
+	cueposfront2[0][1] = states[0,13]
+	cueposfront2[0][2] = states[0,14]
+	cueposback2[0][0] = states[0,15]
+	cueposback2[0][1] = states[0,16]
+	cueposback2[0][2] = states[0,17]'''
+
+	actions = policy.select_action(states[0,:]).detach().numpy()
+	#vel = [0,0,0]
+	for i in range(1, states.shape[0]-1):
+		cueposfront[i][:] , cueposback[i][:] = update_cuepos(cueposfront[i-1][:], actions)
+		#cueposfront[i][:] , cueposback[i][:], vel = update_cuepos(cueposfront[i-1][:],vel, actions)
+		#cueposfront2[i][:] = actions[:3]
+		#cueposback2[i][:] = actions[3:6]
+		#update states
+		states[i,12] = cueposfront[i][0]
+		states[i,13] = cueposfront[i][1]
+		states[i,14] = cueposfront[i][2]
+		states[i,15] = cueposback[i][0]
+		states[i,16] = cueposback[i][1]
+		states[i,17] = cueposback[i][2]
+		actions = policy.select_action(states[i,:]).detach().numpy()
+
+	#actions = policy.select_action(states).detach().numpy()
+	#cueposfront = actions[:,1:3]
+	#cueposback = actions[:,3:5]
+
+	cueballpos = np.zeros((states.shape[0],2))
+	cueballpos[0][0] = states[0][0]
+	cueballpos[0][1] = states[0][2]
+	
+	def animate(i):
+		ax.clear()
+		x_ref = [ref_cueposback[i,0], ref_cueposfront[i,0]]
+		z_ref = [ref_cueposback[i,2], ref_cueposfront[i,2]]
+		ax.plot(x_ref, z_ref, color="green", label = 'reference stick')
+
+
+		x_values = [cueposback[i][0], cueposfront[i][0]]
+		z_values = [cueposback[i][2], cueposfront[i][2]]
+		ax.plot(x_values, z_values, color="blue", label = 'cue stick acc')
+
+		
+		"""x_values = [cueposback2[i][0], cueposfront2[i][0]]
+		z_values = [cueposback2[i][2], cueposfront2[i][2]]
+		ax.plot(x_values, z_values, color="orange", label = 'cue stick pos')"""
+
+		x_val = states[i,0]	
+		z_val = states[i,2]
+		ax.scatter(x_val, z_val, s=60, facecolors='black', edgecolors='black', label = 'cueball')
+		
+		ax.scatter(states[i][6], states[i][8], s=60, facecolors='red', edgecolors='red', label = 'target ball')
+		ax.scatter(states[i][9], states[i][11], s=400, facecolors='none', edgecolors='green', label = 'pocket')
+		ax.set(xlim=(-1, 1), ylim=(-2, 2))
+		ax.legend()
+
+
+	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=40, repeat=False)	
+	plt.close()
+	anim.save('training_plots/'+model+'/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')	
+
 ########################## Main  ########################################
 
 if __name__ == "__main__":
 
-    filename = ["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"]	#"RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv","RL_dataset/Offline_reduced/BL_Offline_reduced.csv"]
-    '''["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
-    "RL_dataset/Offline_reduced/BR_Offline_reduced.csv", "RL_dataset/Offline_reduced/BY_Offline_reduced.csv", "RL_dataset/Offline_reduced/CP_Offline_reduced.csv",
-     "RL_dataset/Offline_reduced/DR_Offline_reduced.csv", "RL_dataset/Offline_reduced/DS_Offline_reduced.csv",
-    "RL_dataset/Offline_reduced/DZ_Offline_reduced.csv", "RL_dataset/Offline_reduced/ESS_Offline_reduced.csv",
-    "RL_dataset/Offline_reduced/KO_Offline_reduced.csv", "RL_dataset/Offline_reduced/LR_Offline_reduced.csv",
-    "RL_dataset/Offline_reduced/JW_Offline_reduced.csv", "RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
-    "RL_dataset/Offline_reduced/GS_Offline_reduced.csv"]'''	
-
-    train_set, test_set = load_clean_data(filename)
+	filename = ["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/CP_Offline_reduced.csv", "RL_dataset/Offline_reduced/CX_Offline_reduced.csv", 
+			"RL_dataset/Offline_reduced/GS_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/JW_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/KO_Offline_reduced.csv", "RL_dataset/Offline_reduced/LR_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/MA_Offline_reduced.csv", "RL_dataset/Offline_reduced/MAI_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/MG_Offline_reduced.csv", "RL_dataset/Offline_reduced/MO_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/PM_Offline_reduced.csv", "RL_dataset/Offline_reduced/SC_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/SC_Offline_reduced.csv"]
 	
-    policy = train(train_set, test_set, state_dim=14, action_dim=3, epochs=10000, train=True, model="TD3_BC")	#TD3_BC #set train=False to load pretrained model
+	'''["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
+	"RL_dataset/Offline_reduced/BR_Offline_reduced.csv", "RL_dataset/Offline_reduced/BY_Offline_reduced.csv", "RL_dataset/Offline_reduced/CP_Offline_reduced.csv",
+	"RL_dataset/Offline_reduced/DR_Offline_reduced.csv", "RL_dataset/Offline_reduced/DS_Offline_reduced.csv",
+	"RL_dataset/Offline_reduced/DZ_Offline_reduced.csv", "RL_dataset/Offline_reduced/ESS_Offline_reduced.csv",
+	"RL_dataset/Offline_reduced/KO_Offline_reduced.csv", "RL_dataset/Offline_reduced/LR_Offline_reduced.csv",
+	"RL_dataset/Offline_reduced/JW_Offline_reduced.csv", "RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
+	"RL_dataset/Offline_reduced/GS_Offline_reduced.csv"]'''
 
+	train_set, test_set = load_clean_data(filename)
+	#train_set = 0
+	#test_set = 0
+	#plot_animated_behaviour_policy(train_set)
+	policy = train(train_set, test_set, state_dim=24, action_dim=4, epochs=5000, train=True, model="TD3_BC")	#state_dim=16 #TD3_BC #set train=False to load pretrained model
 
-    #evaluate(train_set, policy)
-    #plot_animated_behaviour_policy(test_set)
-    #plot_animated_learnt_policy(test_set, policy)
+	
+	#visualize_d4RL_policy("Ant-v2")	#hopper-medium-v0
+	#load_d4rl_scores("results/hopper-medium-v0_TD3_d4rl_score", "results/hopper-medium-v0_TD3_avg_reward.npy", "TD3")
+	#load_d4rl_scores("results/hopper-medium-v0_CQL_d4rl_score", "results/hopper-medium-v0_CQL_avg_reward.npy", "CQL")    #_2
+	#evaluate_agent_performance(test_set, policy)
+	#for i in (34, 65, 92, 113, 137, 168, 188, 214, 247, 281, 302, 327, 357):
+		#plot_action_animated_learnt_policy(test_set, policy, model="TD3_BC", iteration=i)
+
+	#plot_animated_behaviour_policy(test_set)
+	#plot_animated_learnt_policy(test_set, policy)
