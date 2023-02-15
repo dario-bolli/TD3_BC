@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Normal
+from torch.distributions.multivariate_normal import MultivariateNormal
+from torch.distributions.kl import kl_divergence
 from torch.nn.utils import clip_grad_norm_
 import copy
 import math
@@ -124,19 +126,23 @@ def update_cuepos(prev_pos_front, actions): #, vel
 
     new_vel = actions[1:]
     angle = actions[0]*(135 - 45)+45
+    #print("new angle: ", angle)
     angle_complementary = 180-angle
     new_pos_front = prev_pos_front + new_vel*dt
     new_pos_back = [new_pos_front[0] + len_cue_stick*np.cos(np.radians(-angle_complementary)),0, new_pos_front[2] + len_cue_stick*np.sin(np.radians(-angle_complementary))]   #0 on y 
-    return new_pos_front, new_pos_back	#, new_vel
+
+    new_cue_dir = (new_pos_front - new_pos_back)/np.linalg.norm((new_pos_front - new_pos_back))
+    #print("new cue dir: ", new_cue_dir)
+    return new_pos_front, new_pos_back, new_cue_dir	#, new_vel
 
 def compute_reward_evaluation(cuevel, target_corner, reward):
-    target_corner_angle = np.rad2deg(np.arctan2(target_corner[1], target_corner[0]))
-    angle = np.rad2deg(np.arctan2(cuevel[1], cuevel[0]))
+    target_corner_angle = np.rad2deg(np.arctan2(target_corner[2], target_corner[0]))
+    angle = np.rad2deg(np.arctan2(cuevel[2], cuevel[0]))
     if target_corner_angle < 90.0:
         angle = 180 - angle
     mean_pocket = 105.0736
-    lbPocket = mean_pocket - 1	#0.3106383 #= 104.7629617
-    ubPocket = mean_pocket + 1	#0.2543617 #= 105.3279617
+    lbPocket = mean_pocket - 0.5	#0.3106383 #= 104.7629617
+    ubPocket = mean_pocket + 0.5	#0.2543617 #= 105.3279617
 
     if reward == 100:
         reward = 100
@@ -169,7 +175,7 @@ def weighted_sample(dic,prob_dist):
 def weighted_sample_experience(dic, sample_size):
 	ind = []
 	for i in range(sample_size):
-		ind = np.append(ind, np.random.choice(dic['trial'].index))
+		ind = np.append(ind, np.random.choice(np.arange(0,len(dic['trial']))))
 
 	return (torch.FloatTensor(dic['states'].iloc[ind].to_numpy()).to(device), torch.FloatTensor(dic['actions'].iloc[ind].to_numpy()).to(device), 
             torch.FloatTensor(dic['new_states'].iloc[ind].to_numpy()).to(device), torch.FloatTensor(dic['rewards'].iloc[ind].to_numpy()).to(device), 
@@ -391,28 +397,28 @@ class Critic(nn.Module):
 		super(Critic, self).__init__()
 		# Q1 architecture
 		self.l1 = nn.Linear(state_dim + action_dim, 256)
-		self.l2 = nn.Linear(256,256)	#nn.Linear(256, 512)
-		self.l3 = nn.Linear(256, 1)	#nn.Linear(512, 256)
-		#self.l4 = nn.Linear(256, 1)
+		self.l2 = nn.Linear(256,512)	#nn.Linear(256, 512)
+		self.l3 = nn.Linear(512,256)	#nn.Linear(512, 256)
+		self.l4 = nn.Linear(256, 1)
 
 		# Q2 architecture
 		self.l5 = nn.Linear(state_dim + action_dim, 256)
-		self.l6 = nn.Linear(256,256)	#nn.Linear(256, 512)
-		self.l7 = nn.Linear(256, 1)	#nn.Linear(512, 256)
-		#self.l8 = nn.Linear(256, 1)
+		self.l6 = nn.Linear(256,512)	#nn.Linear(256, 512)
+		self.l7 = nn.Linear(512,256)	#nn.Linear(512, 256)
+		self.l8 = nn.Linear(256, 1)
 
 
 	def forward(self, state, action):
 		sa = torch.cat([state, action], 1)
 		q1 = F.relu(self.l1(sa))
 		q1 = F.relu(self.l2(q1))
-		q1 = self.l3(q1)#F.relu(self.l3(q1))
-		#q1 = self.l4(q1)
+		q1 = F.relu(self.l3(q1))
+		q1 = self.l4(q1)
 
 		q2 = F.relu(self.l5(sa))
 		q2 = F.relu(self.l6(q2))
-		q2 = self.l7(q2)	#F.relu(self.l7(q2))
-		#q2 = self.l8(q2)
+		q2 = F.relu(self.l7(q2))
+		q2 = self.l8(q2)
 		return q1, q2
 
 
@@ -421,8 +427,8 @@ class Critic(nn.Module):
 
 		q1 = F.relu(self.l1(sa))
 		q1 = F.relu(self.l2(q1))
-		q1 = self.l3(q1)	 #F.relu(self.l3(q1))
-		#q1 = self.l4(q1)
+		q1 = F.relu(self.l3(q1))
+		q1 = self.l4(q1)
 		return q1
 
 
@@ -447,7 +453,7 @@ class TD3_BC(object):
 
 		self.critic = Critic(state_dim, action_dim).to(device)
 		self.critic_target = copy.deepcopy(self.critic)
-		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)	
+		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)	
 		self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=10000, gamma=8e-5)
 
 		self.max_action = max_action
@@ -546,6 +552,149 @@ class TD3_BC(object):
 		self.actor.load_state_dict(torch.load(filename + "_actor"))
 		self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
 		self.actor_target = copy.deepcopy(self.actor)
+
+
+################################################## TD3 Off-policy ##########################################################
+
+class AC_Off_POC_TD3(object):
+    def __init__(
+            self,
+            state_dim,
+            action_dim,
+            max_action,
+            discount=0.99,
+            tau=0.005,
+            policy_noise=0.2,
+            noise_clip=0.5,
+			alpha=2.5,
+            policy_freq=2,
+            kl_div_var=0.15
+        ):
+        self.device = device
+
+        # Initialize actor networks and optimizer
+        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.actor_target = copy.deepcopy(self.actor)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
+        self.actor_scheduler = torch.optim.lr_scheduler.StepLR(self.actor_optimizer, step_size=200, gamma=1e-5)
+
+        # Initialize critic networks and optimizer
+        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic_target = copy.deepcopy(self.critic)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
+        self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=200, gamma=1e-5)
+
+        # Initialize the training parameters
+        self.max_action = max_action
+        self.discount = discount
+        self.tau = tau
+        self.policy_noise = policy_noise
+        self.noise_clip = noise_clip
+        self.policy_freq = policy_freq
+
+        self.total_it = 0
+
+        self.action_dim = action_dim
+
+        # Initialize the reference Gaussian
+        self.kl_div_var = kl_div_var
+
+        self.ref_gaussian = MultivariateNormal(torch.zeros(self.action_dim).to(self.device),
+                                               torch.eye(self.action_dim).to(self.device) * self.kl_div_var)
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(device)	#.reshape(1, -1)
+        return self.actor(state)	#.cpu().data.numpy().flatten()
+
+    def train(self, experience, batch_size=1):
+        self.total_it += 1
+        a_loss = 0.0
+        c_loss = 0.0
+        # Sample from the experience replay buffer
+        state, action, next_state, reward, not_done = experience
+
+        with torch.no_grad():
+            # Select action according to the target policy and add target smoothing regularization
+            noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            next_action = (self.actor_target(next_state) + noise).clamp(-self.max_action, self.max_action)
+
+            # Compute the target Q-value
+            target_Q1, target_Q2 = self.critic_target(next_state, next_action)
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = reward + not_done * self.discount * target_Q.squeeze()
+
+        # Get the current Q-value estimates
+        current_Q1, current_Q2 = self.critic(state, action)
+
+        try:
+            # Get current actions on the states of external experiences
+            with torch.no_grad():
+                current_action = self.actor(state)
+
+            # Compute the difference batch
+            diff_action_batch = action - current_action
+
+            # Get the mean and covariance matrix for the
+            mean = torch.mean(diff_action_batch, dim=0)
+            cov = torch.mm(torch.transpose(diff_action_batch - mean, 0, 1), diff_action_batch - mean) / batch_size
+
+            multivar_gaussian = MultivariateNormal(mean, cov)
+
+            js_div = (kl_divergence(multivar_gaussian, self.ref_gaussian) + kl_divergence(self.ref_gaussian,
+                                                                                          multivar_gaussian)) / 2
+
+            js_div = torch.exp(-js_div)
+
+            js_weights = js_div.item() * torch.ones_like(reward).to(device)
+        except:
+            js_weights = torch.ones_like(reward).to(device)
+
+        # Compute the critic loss
+        critic_loss = torch.sum(js_weights * (F.mse_loss(current_Q1.squeeze(), target_Q, reduction='none') +
+                                              F.mse_loss(current_Q2.squeeze(), target_Q, reduction='none'))) / torch.sum(js_weights)
+
+        # Optimize the critic
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # Delayed policy updates, update actor networks every update period
+        if self.total_it % self.policy_freq == 0:
+
+            # Compute the actor loss
+            actor_loss = -(js_weights * self.critic.Q1(state, self.actor(state))).sum() / torch.sum(js_weights)
+
+            # Optimize the actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            # Soft update the target networks
+            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+                a_loss += actor_loss.detach().numpy()
+            c_loss += critic_loss.detach().numpy()
+        return c_loss, a_loss
+    # Save the model parameters
+    def save(self, file_name):
+        torch.save(self.actor.state_dict(), file_name + "_actor")
+        torch.save(self.actor_optimizer.state_dict(), file_name + "_actor_optimizer")
+
+        torch.save(self.critic.state_dict(), file_name + "_critic")
+        torch.save(self.critic_optimizer.state_dict(), file_name + "_critic_optimizer")
+
+    # Load the model parameters
+    def load(self, filename):
+        self.actor.load_state_dict(torch.load(filename + "_actor"))
+        self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
+        self.actor_target = copy.deepcopy(self.actor)
+
+        self.critic.load_state_dict(torch.load(filename + "_critic"))
+        self.critic_optimizer.load_state_dict(torch.load(filename + "_critic_optimizer"))
+        self.critic_target = copy.deepcopy(self.critic)
 
 ################################################## CQL Agent ###############################################################
 
@@ -2015,12 +2164,12 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			policy_losses = []
 			evaluation_losses = []
             
-			trajectory_rewards = dataset['rewards'][dataset['terminals']]
+			"""trajectory_rewards = dataset['rewards'][dataset['terminals']]
 
 			prob_dist = np.ones(len(trajectory_rewards))	#len(dataset['trial'].unique())-10)#-1 Because last trial has no terminal state (to be changed in future)
 
 			prob_dist[trajectory_rewards != -10.0] = 50	#500 times higher probs than other traj to be sampled
-			prob_dist = prob_dist/prob_dist.sum()
+			prob_dist = prob_dist/prob_dist.sum()"""
 
 			'''############# D4RL #############
 			evaluations=[]
@@ -2040,28 +2189,19 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			############# D4RL #############'''
 			
 			for i in tqdm(range(1, epochs)):
-				trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
+				experience = weighted_sample_experience(dataset, sample_size=560)   #trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
 				
 				#actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(replay_buffer, batch_size = 512)  #trajectory #, current_alpha, cql_alpha_loss, cql_alpha 
-				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(trajectory, batch_size = 140)
+				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(experience, batch_size = 560)	#trajectory
 				alpha_losses.append(alpha_loss)
 				critic1_losses.append(critic1_loss) # + cql1_scaled_loss)
 				critic2_losses.append(critic2_loss) # + cql2_scaled_loss)
 				policy_losses.append(actor_loss)
 				
-				'''if i%1000==0:
-					avg_reward, d4rl_score = eval_policy(policy, env_name, 0, mean, std)
-					evaluations.append(avg_reward)
-					evaluations2.append(d4rl_score)
-					np.save(f"results/"+env_name+"_CQL_avg_reward", evaluations)
-					np.save(f"results/"+env_name+"_CQL_d4rl_score", evaluations2)
+				if (i%2000 == 0 and i<10000) or i%10000 == 0:
+					plot_action_animated_learnt_policy(train_set, policy,"CQL_SAC",  i)
 
-				if i%3000==0:
-					policy.save("models/D4RL/CQL_policy")
-				'''
-				if i%2000 == 0:
-					plot_3D_animated_learnt_policy(train_set, policy,"CQL_SAC",  i)
-				if i%1000 == 0:
+				if (i%1000 == 0 and i<10000) or i%5000 == 0:
 					#evaluate_agent_performance(test_set, policy)
 					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "CQL_SAC",i , action_dim=action_dim)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
@@ -2102,12 +2242,12 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			c_losses = []
 			evaluation_losses = []
 			
-			trajectory_rewards = dataset['rewards'][dataset['terminals']]
+			"""trajectory_rewards = dataset['rewards'][dataset['terminals']]
 
 			prob_dist = np.ones(len(trajectory_rewards))	#len(dataset['trial'].unique())-10)#-1 Because last trial has no terminal state (to be changed in future)
 
 			prob_dist[trajectory_rewards != -10.0] = 50	#500 times higher probs than other traj to be sampled
-			prob_dist = prob_dist/prob_dist.sum()
+			prob_dist = prob_dist/prob_dist.sum()"""
 			
 			
 			'''############# D4RL #############
@@ -2128,10 +2268,8 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			############# D4RL #############'''
 
 			for i in tqdm(range(1, epochs)):
-				experience = weighted_sample_experience(dataset, sample_size=560)    #weighted_sample(dataset, prob_dist) #sample(dataset) 	   
-				states, actions, new_states, rewards, terminals = experience
-				print("experience shape: ", states.shape, actions.shape)
-				c_loss, a_loss = policy.train(experience, batch_size = 140) #replay_buffer #, args, **kwargs
+				experience = weighted_sample_experience(dataset, sample_size=256)    #weighted_sample(dataset, prob_dist) #sample(dataset) 	   
+				c_loss, a_loss = policy.train(experience, batch_size = 256) #replay_buffer #, args, **kwargs
 				if a_loss != 0.0:	#actor loss updated only once every "policy_freq" update, set to 0 otherwise
 					a_losses.append(a_loss)
 				c_losses.append(c_loss)
@@ -2144,7 +2282,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 				#if i%3000==0:
 					#policy.save("models/D4RL/TD3_BC_policy")'''
                 
-				if i%2 == 0:
+				if i%2000 == 0:
 					#plot_animated_learnt_policy(test_set, policy,"TD3_BC",  i)
 					#plot_3D_animated_learnt_policy(train_set, policy,"TD3_BC",  i)
 					plot_action_animated_learnt_policy(train_set, policy,"TD3_BC",  i)
@@ -2154,9 +2292,10 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "TD3_BC",i, action_dim = action_dim)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
 					policy.save("models/TD3_BC/TD3_BC_policy")
+			
 				policy.actor_scheduler.step()
 				policy.critic_scheduler.step()
-			
+
 			_, evaluation_loss_curve = plt.subplots()
 			evaluation_loss_curve.plot(evaluation_losses)
 			plt.savefig('training_plots/TD3_BC/evaluation_losses_during_training.png')
@@ -2171,12 +2310,55 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 		else:
 			print("load trained model")
 			policy.load("models/TD3_BC/TD3_BC_policy")
+	
+	elif model == "AC_Off_POC_TD3":
+		# Initialize Agent
+		policy = AC_Off_POC_TD3(**kwargs) 
+		print("---------------------------------------")
+		print(f"Policy: {model}")	#, Seed: {args['seed']}")
+		print("---------------------------------------")
+		if train == True:
+			a_losses = []
+			c_losses = []
+			evaluation_losses = []
+
+			for i in tqdm(range(1, epochs)):
+				policy.actor_scheduler.step()
+				policy.critic_scheduler.step()
+				experience = weighted_sample_experience(dataset, sample_size=256)      
+				c_loss, a_loss = policy.train(experience) 
+				if a_loss != 0.0:	
+					a_losses.append(a_loss)
+				c_losses.append(c_loss)
+                
+				if i%2000 == 0:
+					plot_action_animated_learnt_policy(train_set, policy,"AC_Off_POC_TD3",  i)
+
+				if i%50 == 0:
+					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "AC_Off_POC_TD3",i, action_dim = action_dim)
+					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
+					policy.save("models/AC_Off_POC_TD3/AC_Off_POC_TD3_policy")
+			
+			_, evaluation_loss_curve = plt.subplots()
+			evaluation_loss_curve.plot(evaluation_losses)
+			plt.savefig('training_plots/AC_Off_POC_TD3/evaluation_losses_during_training.png')
+
+			_, actor_loss_curve = plt.subplots()
+			actor_loss_curve.plot(a_losses)
+			plt.savefig('training_plots/AC_Off_POC_TD3/actor_losses_training_curve.png')
+
+			_, critic_loss_curve = plt.subplots()
+			critic_loss_curve.plot(c_losses)
+			plt.savefig('training_plots/AC_Off_POC_TD3/critic_losses_training_curve.png')
+		else:
+			print("load trained model")
+			policy.load("models/AC_Off_POC_TD3/TD3_BC_policy")
 	else:
 		print(model, "is not implemented")
 		policy=None
 	return policy
 ######################### Evaluation ####################################
-def evaluate_agent_performance(dataset, policy):
+def evaluate_agent_performance(dataset, policy, model="TD3_BC"):
 	rewards = []
 	rewards_human = []
 	radius = 0.005
@@ -2186,10 +2368,15 @@ def evaluate_agent_performance(dataset, policy):
 		states, actions, new_states, reward_, terminals= get_trajectory(dataset, trial)
 		
 		
-		states = states.detach().numpy()
+		#states = states
 		state = states[0][:]
-		pi_e = policy.select_action(state).detach().numpy()
-		cuevel = pi_e[1:]
+		
+		if model == "CQL_SAC":
+			actions = policy.select_action(states[0,:], eval=True)
+		else:
+			actions = policy.select_action(states[0,:])
+		cuevel = actions[1:]
+		state = states[0,:].detach().numpy()
 		state_cueball = state[0:3]
 		state_cue_front = state[12:15]
 		state_cue_back = state[15:18]
@@ -2198,23 +2385,27 @@ def evaluate_agent_performance(dataset, policy):
 		reward = 0.0
 		for k in range(states.shape[0]):
 			#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-			next_state_cue_front, next_state_cue_back = update_cuepos(state_cue_front, pi_e)
+			next_state_cue_front, next_state_cue_back, next_state_cue_direction = update_cuepos(state_cue_front, actions.detach().numpy())
 			if (next_state_cue_front[0] - state_cueball[0])**2 + (next_state_cue_front[2] - state_cueball[2])**2 < radius \
 			and next_state_cue_front[1] < state_cueball[1] + vertical_margin:
 				
 				next_state_cueball = update_cueballpos(state_cueball, cuevel)
 				states[k][0:3] = next_state_cueball
-				reward = compute_reward_evaluation(cuevel, state[6:8], reward)
+				reward = compute_reward_evaluation(cuevel, state[9:12], reward)
 			states[k][21:] = cuevel
 			states[k][12:15] = next_state_cue_front
 			states[k][15:18] = next_state_cue_back
-			pi_e = policy.select_action(states[k][:]).detach().numpy()
-			cuevel = pi_e[1:]
+			states[k][18:21] = next_state_cue_direction
+			states[k][21:] = actions[1:]
+			if model == "CQL_SAC":
+				actions = policy.select_action(states[k,:], eval=True)
+			else:
+				actions = policy.select_action(states[k,:])
+			cuevel = actions[1:].detach().numpy()
 		rewards = np.append(rewards, reward)
 		rewards_human = np.append(rewards_human, reward_human)
 	print("number of successful trials agent: ", np.count_nonzero(rewards), rewards)
 	print("number of successful trials human subject: ", np.count_nonzero(rewards_human+10), rewards_human)
-
 
 def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration=44, action_dim=3):
 	#losses = []
@@ -2275,7 +2466,10 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 
 					for k in range(states.size(dim=0)):
 						#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-						pi_e = policy.select_action(states[k][:])
+						if model == "CQL_SAC":
+							pi_e = policy.select_action(states[k][:], eval=True)
+						else:
+							pi_e = policy.select_action(states[k][:])
 						pi_b = actions[k][:]
 						#print("step ", k, pi_e, pi_b)
 						epoch_loss[k] = F.mse_loss(pi_e, pi_b)
@@ -2324,7 +2518,10 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 
 					for k in range(states.size(dim=0)):
 						#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-						pi_e_u = policy.select_action(states[k][:])
+						if model == "CQL_SAC":
+							pi_e_u = policy.select_action(states[k][:], eval=True)
+						else:
+							pi_e_u = policy.select_action(states[k][:])
 						pi_b_u = actions[k][:]
 						epoch_loss_u[k] = F.mse_loss(pi_e_u, pi_b_u)
 						loss += F.mse_loss(pi_e_u, pi_b_u)
@@ -2587,7 +2784,7 @@ def plot_animated_learnt_policy(dataset, policy, model="TD3_BC", iteration=44):
 	#print("saved GIF")
 
 def plot_3D_animated_learnt_policy(dataset, policy, model="TD3_BC", iteration=44):
-
+	### Using cupos prediction in actions ###
 	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[iteration])
 	states = states#.detach().numpy()
 	fig, ax = plt.subplots(1,1)
@@ -2660,26 +2857,27 @@ def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteratio
 	ref_cueposback = states[:,15:18].clone().detach()
 	cueposfront = np.zeros((states.shape[0],3))
 	cueposback = np.zeros((states.shape[0],3))
+	cuedirection = np.zeros((states.shape[0],3))
 	cueposfront[0][0] = states[0,12]
 	cueposfront[0][1] = states[0,13]
 	cueposfront[0][2] = states[0,14]
 	cueposback[0][0] = states[0,15]
 	cueposback[0][1] = states[0,16]
 	cueposback[0][2] = states[0,17]
+	cuedirection[0][0] = states[0,18] 
+	cuedirection[0][1] = states[0,19]
+	cuedirection[0][2] = states[0,20]
 
-	'''cueposfront2 = np.zeros((states.shape[0],3))
-	cueposback2 = np.zeros((states.shape[0],3))
-	cueposfront2[0][0] = states[0,12]
-	cueposfront2[0][1] = states[0,13]
-	cueposfront2[0][2] = states[0,14]
-	cueposback2[0][0] = states[0,15]
-	cueposback2[0][1] = states[0,16]
-	cueposback2[0][2] = states[0,17]'''
-
-	actions = policy.select_action(states[0,:]).detach().numpy()
+	if model == "CQL_SAC":
+		actions = policy.select_action(states[0,:], eval=True)
+	else:
+		actions = policy.select_action(states[0,:])
+	
 	#vel = [0,0,0]
 	for i in range(1, states.shape[0]-1):
-		cueposfront[i][:] , cueposback[i][:] = update_cuepos(cueposfront[i-1][:], actions)
+		cueposfront[i][:] , cueposback[i][:], cuedirection[i][:] = update_cuepos(cueposfront[i-1][:], actions.detach().numpy())	
+		#print("state angle: ", np.rad2deg(np.arctan2(states[i,20], states[i,18])))
+		#print("state cue dir: ", states[i,18:21])
 		#cueposfront[i][:] , cueposback[i][:], vel = update_cuepos(cueposfront[i-1][:],vel, actions)
 		#cueposfront2[i][:] = actions[:3]
 		#cueposback2[i][:] = actions[3:6]
@@ -2690,12 +2888,23 @@ def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteratio
 		states[i,15] = cueposback[i][0]
 		states[i,16] = cueposback[i][1]
 		states[i,17] = cueposback[i][2]
-		actions = policy.select_action(states[i,:]).detach().numpy()
+		states[i,18] = cuedirection[i][0]
+		states[i,19] = cuedirection[i][1]
+		states[i,20] = cuedirection[i][2]
+		states[i,21] = actions[1]
+		states[i,22] = actions[2]
+		states[i,23] = actions[3]
+
+		if model == "CQL_SAC":
+			actions = policy.select_action(states[i,:], eval=True)
+		else:
+			actions = policy.select_action(states[i,:])
 
 	#actions = policy.select_action(states).detach().numpy()
 	#cueposfront = actions[:,1:3]
 	#cueposback = actions[:,3:5]
 
+	states = states.cpu().detach().numpy()
 	cueballpos = np.zeros((states.shape[0],2))
 	cueballpos[0][0] = states[0][0]
 	cueballpos[0][1] = states[0][2]
@@ -2721,7 +2930,7 @@ def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteratio
 		ax.scatter(x_val, z_val, s=60, facecolors='black', edgecolors='black', label = 'cueball')
 		
 		ax.scatter(states[i][6], states[i][8], s=60, facecolors='red', edgecolors='red', label = 'target ball')
-		ax.scatter(states[i][9], states[i][11], s=400, facecolors='none', edgecolors='green', label = 'pocket')
+		ax.scatter(states[i][9], states[i][11], s=200, facecolors='none', edgecolors='green', label = 'pocket')
 		ax.set(xlim=(-1, 1), ylim=(-2, 2))
 		ax.legend()
 
@@ -2734,7 +2943,8 @@ def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteratio
 
 if __name__ == "__main__":
 
-	filename = ["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
+	filename = ["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"]
+	'''["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
 			"RL_dataset/Offline_reduced/CP_Offline_reduced.csv", "RL_dataset/Offline_reduced/CX_Offline_reduced.csv", 
 			"RL_dataset/Offline_reduced/GS_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
 			"RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/JW_Offline_reduced.csv",
@@ -2742,7 +2952,7 @@ if __name__ == "__main__":
 			"RL_dataset/Offline_reduced/MA_Offline_reduced.csv", "RL_dataset/Offline_reduced/MAI_Offline_reduced.csv",
 			"RL_dataset/Offline_reduced/MG_Offline_reduced.csv", "RL_dataset/Offline_reduced/MO_Offline_reduced.csv",
 			"RL_dataset/Offline_reduced/PM_Offline_reduced.csv", "RL_dataset/Offline_reduced/SC_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/SC_Offline_reduced.csv"]
+			"RL_dataset/Offline_reduced/SC_Offline_reduced.csv"]'''
 	
 	'''["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
 	"RL_dataset/Offline_reduced/BR_Offline_reduced.csv", "RL_dataset/Offline_reduced/BY_Offline_reduced.csv", "RL_dataset/Offline_reduced/CP_Offline_reduced.csv",
@@ -2762,8 +2972,8 @@ if __name__ == "__main__":
 	#visualize_d4RL_policy("Ant-v2")	#hopper-medium-v0
 	#load_d4rl_scores("results/hopper-medium-v0_TD3_d4rl_score", "results/hopper-medium-v0_TD3_avg_reward.npy", "TD3")
 	#load_d4rl_scores("results/hopper-medium-v0_CQL_d4rl_score", "results/hopper-medium-v0_CQL_avg_reward.npy", "CQL")    #_2
-	#evaluate_agent_performance(test_set, policy)
-	#for i in (34, 65, 92, 113, 137, 168, 188, 214, 247, 281, 302, 327, 357):
+	evaluate_agent_performance(test_set, policy, model="TD3_BC")
+	#for i in (65, 113, 188, 247, 302, 357):
 		#plot_action_animated_learnt_policy(test_set, policy, model="TD3_BC", iteration=i)
 
 	#plot_animated_behaviour_policy(test_set)
