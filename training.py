@@ -35,14 +35,14 @@ import argparse
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-'''import gym
+import gym
 import argparse
 import os
 import d4rl
 
 import utils
 import warnings
-warnings.filterwarnings("ignore")'''
+warnings.filterwarnings("ignore")
 ######################################################## Eval policy D4RL ######################################################################
 # Runs policy for X episodes and returns D4RL score
 # A fixed seed is used for the eval environment
@@ -1196,7 +1196,7 @@ def hidden_init(layer):
 class Actor_CQL(nn.Module):
     """Actor (Policy) Model."""
 
-    def __init__(self, state_size, action_size, hidden_size=32, init_w=3e-3, log_std_min=-20, log_std_max=2):
+    def __init__(self, state_size, action_size, hidden_size=256, hidden_size2=512, init_w=3e-3, log_std_min=-20, log_std_max=2):
         """Initialize parameters and build model.
         Params
         ======
@@ -1211,7 +1211,8 @@ class Actor_CQL(nn.Module):
         self.log_std_max = log_std_max
         
         self.fc1 = nn.Linear(state_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size2)
+        self.fc3 = nn.Linear(hidden_size2, hidden_size)
 
         self.mu = nn.Linear(hidden_size, action_size)
         self.log_std_linear = nn.Linear(hidden_size, action_size)
@@ -1220,6 +1221,7 @@ class Actor_CQL(nn.Module):
 
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
         mu = self.mu(x)
 
         log_std = self.log_std_linear(x)
@@ -1257,7 +1259,7 @@ class Actor_CQL(nn.Module):
 class Critic_CQL(nn.Module):
     """Critic (Value) Model."""
 
-    def __init__(self, state_size, action_size, hidden_size=32, seed=1):
+    def __init__(self, state_size, action_size, hidden_size=256, hidden_size2=512, seed=1):
         """Initialize parameters and build model.
         Params
         ======
@@ -1269,21 +1271,24 @@ class Critic_CQL(nn.Module):
         super(Critic_CQL, self).__init__()
         self.seed = torch.manual_seed(seed)
         self.fc1 = nn.Linear(state_size+action_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, 1)
+        self.fc2 = nn.Linear(hidden_size, hidden_size2)
+        self.fc3 = nn.Linear(hidden_size2, hidden_size)
+        self.fc4 = nn.Linear(hidden_size, 1)
         self.reset_parameters()
 
     def reset_parameters(self):
         self.fc1.weight.data.uniform_(*hidden_init(self.fc1))
         self.fc2.weight.data.uniform_(*hidden_init(self.fc2))
-        self.fc3.weight.data.uniform_(-3e-3, 3e-3)
+        self.fc3.weight.data.uniform_(*hidden_init(self.fc3))
+        self.fc4.weight.data.uniform_(-3e-3, 3e-3)
 
     def forward(self, state, action):
         """Build a critic (value) network that maps (state, action) pairs -> Q-values."""
         x = torch.cat((state, action), dim=-1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        x = F.relu(self.fc3(x))
+        return self.fc4(x)
 
 class CQLSAC(nn.Module):
     """Interacts with and learns from the environment."""
@@ -1310,6 +1315,7 @@ class CQLSAC(nn.Module):
         self.gamma = 0.99
         self.tau = 1e-2
         hidden_size = 256
+        hidden_size2 = 512
         learning_rate = 6e-5  
         self.clip_grad_param = 1
 
@@ -1329,20 +1335,20 @@ class CQLSAC(nn.Module):
         
         # Actor Network 
 
-        self.actor_local = Actor_CQL(state_size, action_size, hidden_size).to(device)
+        self.actor_local = Actor_CQL(state_size, action_size, hidden_size, hidden_size2).to(device)
         self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=learning_rate)     
         
         # Critic Network (w/ Target Network)
 
-        self.critic1 = Critic_CQL(state_size, action_size, hidden_size, 2).to(device)
-        self.critic2 = Critic_CQL(state_size, action_size, hidden_size, 1).to(device)
+        self.critic1 = Critic_CQL(state_size, action_size, hidden_size, hidden_size2, 2).to(device)
+        self.critic2 = Critic_CQL(state_size, action_size, hidden_size, hidden_size2, 1).to(device)
         
         assert self.critic1.parameters() != self.critic2.parameters()
         
-        self.critic1_target = Critic_CQL(state_size, action_size, hidden_size).to(device)
+        self.critic1_target = Critic_CQL(state_size, action_size, hidden_size, hidden_size2).to(device)
         self.critic1_target.load_state_dict(self.critic1.state_dict())
 
-        self.critic2_target = Critic_CQL(state_size, action_size, hidden_size).to(device)
+        self.critic2_target = Critic_CQL(state_size, action_size, hidden_size, hidden_size2).to(device)
         self.critic2_target.load_state_dict(self.critic2.state_dict())
 
         self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=learning_rate)
@@ -1397,9 +1403,9 @@ class CQLSAC(nn.Module):
             gamma (float): discount factor
         """
         # Sample replay buffer 
-        #states, actions, next_states, rewards, not_dones = experiences.sample(512)
-        states, actions, next_states, rewards, dones = experiences
-        not_dones = ~ dones
+        states, actions, next_states, rewards, not_dones = experiences.sample(512)
+        #states, actions, next_states, rewards, dones = experiences
+        #not_dones = ~ dones
         actor_losses_ = []
         alpha_losses_ = []
         critic1_losses_ = []
@@ -2171,7 +2177,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			prob_dist[trajectory_rewards != -10.0] = 50	#500 times higher probs than other traj to be sampled
 			prob_dist = prob_dist/prob_dist.sum()"""
 
-			'''############# D4RL #############
+			############# D4RL #############
 			evaluations=[]
 			evaluations2=[]
 			env_name = "hopper-medium-v0"
@@ -2186,13 +2192,13 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
 			replay_buffer.convert_D4RL(d4rl.qlearning_dataset(env))
 			mean,std = replay_buffer.normalize_states() 
-			############# D4RL #############'''
+			############# D4RL #############
 			
 			for i in tqdm(range(1, epochs)):
-				experience = weighted_sample_experience(dataset, sample_size=560)   #trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
+				#experience = weighted_sample_experience(dataset, sample_size=560)   #trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
 				
-				#actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(replay_buffer, batch_size = 512)  #trajectory #, current_alpha, cql_alpha_loss, cql_alpha 
-				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(experience, batch_size = 560)	#trajectory
+				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(replay_buffer, batch_size = 512)  #trajectory #, current_alpha, cql_alpha_loss, cql_alpha 
+				#actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(experience, batch_size = 560)	#trajectory
 				alpha_losses.append(alpha_loss)
 				critic1_losses.append(critic1_loss) # + cql1_scaled_loss)
 				critic2_losses.append(critic2_loss) # + cql2_scaled_loss)
@@ -2358,6 +2364,31 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 		policy=None
 	return policy
 ######################### Evaluation ####################################
+
+def off_policy_evaluation(data, behavior_policy, target_policy, gamma):
+    """ behavior_policy is a dictionary that maps each state to a probability distribution over actions, which represents the behavior policy used to collect the data
+    target_policy is a dictionary that maps each state to a probability distribution over actions, which represents the policy being evaluated. 
+    gamma is the discount factor.
+    The function computes the expected return of the target policy using the Importance Sampling technique. 
+    The return for each trajectory is weighted by the importance sampling ratio W, which is the ratio of the probabilities of taking the actions under the target policy 
+    and the behavior policy. 
+    The function returns the average of the weighted returns over all trajectories in the dataset."""
+    returns = []
+    for episode in data:
+        G = 0.0
+        W = 1.0
+        for t in range(len(episode)):
+            state, action, reward, next_state, done = episode[t]
+            if done:
+                break
+            if behavior_policy[state][action] == 0:
+                break
+            W *= target_policy[state][action] / behavior_policy[state][action]
+            G += reward * W * (gamma ** t)
+        returns.append(G)
+    return np.mean(returns)
+
+
 def evaluate_agent_performance(dataset, policy, model="TD3_BC"):
 	rewards = []
 	rewards_human = []
@@ -2962,19 +2993,20 @@ if __name__ == "__main__":
 	"RL_dataset/Offline_reduced/JW_Offline_reduced.csv", "RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
 	"RL_dataset/Offline_reduced/GS_Offline_reduced.csv"]'''
 
-	train_set, test_set = load_clean_data(filename)
-	#train_set = 0
-	#test_set = 0
+	#train_set, test_set = load_clean_data(filename)
+	train_set = 0
+	test_set = 0
 	#plot_animated_behaviour_policy(train_set)
-	policy = train(train_set, test_set, state_dim=24, action_dim=4, epochs=5000, train=True, model="TD3_BC")	#state_dim=16 #TD3_BC #set train=False to load pretrained model
+	policy = train(train_set, test_set, state_dim=11, action_dim=3, epochs=10000, train=True, model="CQL_SAC")	#state_dim=16 #TD3_BC #set train=False to load pretrained model
 
 	
 	#visualize_d4RL_policy("Ant-v2")	#hopper-medium-v0
 	#load_d4rl_scores("results/hopper-medium-v0_TD3_d4rl_score", "results/hopper-medium-v0_TD3_avg_reward.npy", "TD3")
 	#load_d4rl_scores("results/hopper-medium-v0_CQL_d4rl_score", "results/hopper-medium-v0_CQL_avg_reward.npy", "CQL")    #_2
-	evaluate_agent_performance(test_set, policy, model="TD3_BC")
+	evaluate_agent_performance(test_set, policy, model="CQL_SAC")
 	#for i in (65, 113, 188, 247, 302, 357):
 		#plot_action_animated_learnt_policy(test_set, policy, model="TD3_BC", iteration=i)
 
 	#plot_animated_behaviour_policy(test_set)
 	#plot_animated_learnt_policy(test_set, policy)
+    #score = off_policy_eval(behavior_policy, policy, num_eval_episodes=1000)

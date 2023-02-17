@@ -23,28 +23,32 @@ def update_cueballpos(prev_pos, velocity):
     new_pos = prev_pos + velocity*dt
     return new_pos
 
-def update_cuepos(prev_pos_front, actions): #, vel
+def update_cuepos(prev_pos_front, actions, call="plot"): #, vel
     dt = 0.0111
     len_cue_stick = 1.21	#fixed value approximate over all subjects and trials, but not important to be precise, just for visualisation
     
-    #acceleration = actions[10:]
-    #acceleration = acceleration*(158.1916216216216)
+    #acceleration = actions[1:]*(329+282)-282 
     #new_vel = vel + acceleration*dt 
 
-    new_vel = actions[1:]
+    new_vel = actions[1:]*(3 + 3) - 3
     angle = actions[0]*(135 - 45)+45
     #print("action angle: ", angle)
     angle_complementary = 180-angle
     new_pos_front = prev_pos_front + new_vel*dt
     new_pos_back = [new_pos_front[0] + len_cue_stick*np.cos(np.radians(-angle_complementary)),0, new_pos_front[2] + len_cue_stick*np.sin(np.radians(-angle_complementary))]   #0 on y 
-    
+
     new_cue_dir = (new_pos_front - new_pos_back)/np.linalg.norm((new_pos_front - new_pos_back))
     #print("new cue dir: ", new_cue_dir)
-    return new_pos_front, new_pos_back, new_cue_dir			#, new_vel
+    if call=="evaluation":
+        return torch.tensor(new_pos_front, device=device), torch.tensor(new_pos_back, device=device), torch.tensor(new_cue_dir, device=device)			#, new_vel
+    else:
+        return new_pos_front, new_pos_back, new_cue_dir
 
-def compute_reward_evaluation(cuevel, target_corner, reward):
+def compute_reward_evaluation(angle, target_corner, reward):	#cuevel
     target_corner_angle = np.rad2deg(np.arctan2(target_corner[2], target_corner[0]))
-    angle = np.rad2deg(np.arctan2(cuevel[2], cuevel[0]))
+    #angle = np.rad2deg(np.arctan2(cuevel[2], cuevel[0]))
+    angle = angle*(135 - 45)+45
+    print("pred angle: ", angle)
     if target_corner_angle < 90.0:
         angle = 180 - angle
     mean_pocket = 105.0736
@@ -203,6 +207,7 @@ class Actor(nn.Module):
 		self.l2 = nn.Linear(256, 512)
 		self.l3 = nn.Linear(512, 256)
 		self.l4 = nn.Linear(256, action_dim)
+		self.dropout = nn.Dropout(0.25)
 		#self.actions_upper_bound = torch.tensor([1,1,1,1,1,1,1,1,0.2,1])#,1,1])    #135
 		#self.actions_lower_bound = torch.tensor([0,0,0,0,0,0,-1,-1,-0.2,-1])#,-1,-1])  #45
 		self.max_action = max_action
@@ -210,8 +215,11 @@ class Actor(nn.Module):
 
 	def forward(self, state):
 		a = F.relu(self.l1(state))
+		a = self.dropout(a)
 		a = F.relu(self.l2(a))
+		a = self.dropout(a)
 		a = F.relu(self.l3(a))
+		a = self.dropout(a)
 		a = torch.tanh(self.l4(a))
 		#rescaled_actions = self.actions_lower_bound + (self.actions_upper_bound - self.actions_lower_bound) * (a + 1) / 2
 		return 	a	#rescaled_actions #torch.tanh(self.l4(a))
@@ -224,6 +232,7 @@ class Critic(nn.Module):
 		self.l2 = nn.Linear(256, 512)
 		self.l3 = nn.Linear(512, 256)
 		self.l4 = nn.Linear(256, 1)
+		self.dropout = nn.Dropout(0.25)
 
 		# Q2 architecture
 		self.l5 = nn.Linear(state_dim + action_dim, 256)
@@ -235,13 +244,19 @@ class Critic(nn.Module):
 	def forward(self, state, action):
 		sa = torch.cat([state, action], 1)
 		q1 = F.relu(self.l1(sa))
+		q1 = self.dropout(q1)
 		q1 = F.relu(self.l2(q1))
+		q1 = self.dropout(q1)
 		q1 = F.relu(self.l3(q1))
+		q1 = self.dropout(q1)
 		q1 = self.l4(q1)
 
 		q2 = F.relu(self.l5(sa))
+		q2 = self.dropout(q2)
 		q2 = F.relu(self.l6(q2))
+		q2 = self.dropout(q2)
 		q2 = F.relu(self.l7(q2))
+		q2 = self.dropout(q2)
 		q2 = self.l8(q2)
 		return q1, q2
 
@@ -250,8 +265,11 @@ class Critic(nn.Module):
 		sa = torch.cat([state, action], 1)
 
 		q1 = F.relu(self.l1(sa))
+		q1 = self.dropout(q1)
 		q1 = F.relu(self.l2(q1))
+		q1 = self.dropout(q1)
 		q1 = F.relu(self.l3(q1))
+		q1 = self.dropout(q1)
 		q1 = self.l4(q1)
 		return q1
 
@@ -362,12 +380,12 @@ class TD3_BC(object):
 
 
 	def load(self, filename):
-		self.critic.load_state_dict(torch.load(filename + "_critic"))
-		self.critic_optimizer.load_state_dict(torch.load(filename + "_critic_optimizer"))
+		self.critic.load_state_dict(torch.load(filename + "_critic", map_location=device))
+		self.critic_optimizer.load_state_dict(torch.load(filename + "_critic_optimizer", map_location=device))
 		self.critic_target = copy.deepcopy(self.critic)
 
-		self.actor.load_state_dict(torch.load(filename + "_actor"))
-		self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
+		self.actor.load_state_dict(torch.load(filename + "_actor", map_location=device))
+		self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer", map_location=device))
 		self.actor_target = copy.deepcopy(self.actor)
 
 
@@ -542,12 +560,16 @@ class Actor_CQL(nn.Module):
         self.fc3 = nn.Linear(hidden_size2, hidden_size)
         self.mu = nn.Linear(hidden_size, action_size)
         self.log_std_linear = nn.Linear(hidden_size, action_size)
-
+        self.dropout = nn.Dropout(0.25)
+        
     def forward(self, state):
 
         x = F.relu(self.fc1(state))
+        x = self.dropout(x)
         x = F.relu(self.fc2(x))
+        x = self.dropout(x)
         x = F.relu(self.fc3(x))
+        x = self.dropout(x)
         mu = self.mu(x)
 
         log_std = self.log_std_linear(x)
@@ -595,11 +617,12 @@ class Critic_CQL(nn.Module):
             hidden_size (int): Number of nodes in the network layers
         """
         super(Critic_CQL, self).__init__()
-        self.seed = torch.manual_seed(seed)
+        #self.seed = torch.manual_seed(seed)
         self.fc1 = nn.Linear(state_size+action_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size2)
+        self.fc2 = nn.Linear(hidden_size,hidden_size2)
         self.fc3 = nn.Linear(hidden_size2, hidden_size)
         self.fc4 = nn.Linear(hidden_size, 1)
+        self.dropout = nn.Dropout(0.25)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -612,8 +635,11 @@ class Critic_CQL(nn.Module):
         """Build a critic (value) network that maps (state, action) pairs -> Q-values."""
         x = torch.cat((state, action), dim=-1)
         x = F.relu(self.fc1(x))
+        x = self.dropout(x)
         x = F.relu(self.fc2(x))
+        x = self.dropout(x)
         x = F.relu(self.fc3(x))
+        x = self.dropout(x)
         return self.fc4(x)
 
 class CQLSAC(nn.Module):
@@ -843,7 +869,7 @@ class CQLSAC(nn.Module):
             actor_losses_.append(actor_loss.item())
 
             #actor_loss.item(), alpha_loss.item(), critic1_loss.item(), critic2_loss.item(), cql1_scaled_loss.item(), cql2_scaled_loss.item(), current_alpha, cql_alpha_loss.item(), cql_alpha.item()
-            return alpha_losses_, critic1_losses_, critic2_losses_,cql1_scaled_losses_, cql2_scaled_losses_, actor_losses_
+            return actor_losses_, alpha_losses_, critic1_losses_, critic2_losses_,cql1_scaled_losses_, cql2_scaled_losses_
 
     def soft_update(self, local_model , target_model):
         """Soft update model parameters.
@@ -867,19 +893,19 @@ class CQLSAC(nn.Module):
         torch.save(self.actor_optimizer.state_dict(), filename + "_actor_optimizer")
 
     def load(self, filename):
-        self.critic1.load_state_dict(torch.load(filename + "_critic1"))
-        self.critic1_optimizer.load_state_dict(torch.load(filename + "_critic1_optimizer"))
-        self.critic1_target = copy.deepcopy(self.critic)
-        self.critic2.load_state_dict(torch.load(filename + "_critic12"))
-        self.critic2_optimizer.load_state_dict(torch.load(filename + "_critic2_optimizer"))
+        self.critic1.load_state_dict(torch.load(filename + "_critic1", map_location=device))
+        self.critic1_optimizer.load_state_dict(torch.load(filename + "_critic1_optimizer", map_location=device))
+        self.critic1_target = copy.deepcopy(self.critic1)
+        self.critic2.load_state_dict(torch.load(filename + "_critic2", map_location=device))
+        self.critic2_optimizer.load_state_dict(torch.load(filename + "_critic2_optimizer", map_location=device))
         self.critic2_target = copy.deepcopy(self.critic2)
 
-        self.actor_local.load_state_dict(torch.load(filename + "_actor"))
-        self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
+        self.actor_local.load_state_dict(torch.load(filename + "_actor", map_location=device))
+        self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer", map_location=device))
         self.actor_target = copy.deepcopy(self.actor_local)
 
 ######################### Train ####################################
-def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True, model = "TD3_BC", data_folder = "data"):  
+def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True, agent = "TD3_BC", data_folder = ""):  
 	print("start Training")
 	# Environment State Properties
 	max_action = 1
@@ -924,16 +950,18 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 		"alpha": args['alpha']
 	    }
 
-	if model == "CQL_SAC":
+	if agent == "CQL_SAC":
 		# Initialize Agent
 		policy = CQLSAC(state_dim,action_dim)
 		print("---------------------------------------")
-		print(f"Policy: {model}")
+		print(f"Policy: {agent}")
 		print("---------------------------------------")
 		if train == True:
 			alpha_losses = []
 			critic1_losses = []
 			critic2_losses = []
+			cql1_scaled_losses = []
+			cql2_scaled_losses = []
 			policy_losses = []
 			evaluation_losses = []
             
@@ -945,6 +973,8 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 				critic1_losses.append(critic1_loss) # + cql1_scaled_loss)
 				critic2_losses.append(critic2_loss) # + cql2_scaled_loss)
 				policy_losses.append(actor_loss)
+				cql1_scaled_losses.append( cql1_scaled_loss)
+				cql2_scaled_losses.append(cql2_scaled_loss)
 				
 				if (i%2000 == 0 and i<10000) or i%10000 == 0:
 					plot_action_animated_learnt_policy(train_set, policy,"CQL_SAC",  i, data_folder)
@@ -953,57 +983,44 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 					#evaluate_agent_performance(test_set, policy)
 					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "CQL_SAC",i , action_dim, data_folder)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
-					if data_folder == "data":
-						policy.save("models/CQL_SAC/CQL_SAC_policy")
-					else:	
-						policy.save("models/CQL_SAC_original/CQL_SAC_policy")
+					policy.save('models/CQL_SAC'+data_folder+'/CQL_SAC_policy')
 			_, alpha_loss_curve = plt.subplots()
 			alpha_loss_curve.plot(alpha_losses)
-			if data_folder == "data":
-				plt.savefig('training_plots/CQL_SAC/alpha_losses_training_curve.png')
-			else:
-				plt.savefig('training_plots/CQL_SAC_original/alpha_losses_training_curve.png')
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/alpha_losses_training_curve.png')
 
 			_, critic1_loss_curve = plt.subplots()
 			critic1_loss_curve.plot(critic1_losses)
-			if data_folder == "data":
-				plt.savefig('training_plots/CQL_SAC/critic1_losses_training_curve.png')
-			else:
-				plt.savefig('training_plots/CQL_SAC_original/critic1_losses_training_curve.png')
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/critic1_losses_training_curve.png')
 
 			_, critic2_loss_curve = plt.subplots()
-			critic2_loss_curve.plot(alpha_losses)
-			if data_folder == "data":
-				plt.savefig('training_plots/CQL_SAC/critic2_losses_training_curve.png')
-			else:
-				plt.savefig('training_plots/CQL_SAC_original/critic2_losses_training_curve.png')
+			critic2_loss_curve.plot(critic2_losses)
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/critic2_losses_training_curve.png')
 
 			_, policy_loss_curve = plt.subplots()
 			policy_loss_curve.plot(policy_losses)
-			if data_folder == "data":
-				plt.savefig('training_plots/CQL_SAC/policy_losses_training_curve.png')
-			else:
-				plt.savefig('training_plots/CQL_SAC_original/policy_losses_training_curve.png')
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/policy_losses_training_curve.png')
 
 			_, evaluation_loss_curve = plt.subplots()
 			evaluation_loss_curve.plot(evaluation_losses)
-			if data_folder == "data":
-				plt.savefig('training_plots/CQL_SAC/evaluation_losses_during_training.png')
-			else:
-				plt.savefig('training_plots/CQL_SAC_original/evaluation_losses_during_training.png')
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/evaluation_losses_during_training.png')
+
+			_, cql1_scaled_loss_curve = plt.subplots()
+			cql1_scaled_loss_curve.plot(cql1_scaled_losses)
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/cql1_scaled_losses_during_training.png')
+			
+			_, cql2_scaled_loss_curve = plt.subplots()
+			cql2_scaled_loss_curve.plot(cql2_scaled_losses)
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/cql2_scaled_losses_during_training.png')
 
 		else:
 			print("load trained model")
-			if data_folder == "data":
-				policy.load("models/CQL_SAC/CQL_SAC_policy")
-			else:
-				policy.load("models/CQL_SAC_original/CQL_SAC_policy")
+			policy.load('models/CQL_SAC'+data_folder+'/CQL_SAC_policy')
 
-	elif model == "TD3_BC":
+	elif agent == "TD3_BC":
 		# Initialize Agent
 		policy = TD3_BC(**kwargs) 
 		print("---------------------------------------")
-		print(f"Policy: {model}")	#, Seed: {args['seed']}")
+		print(f"Policy: {agent}")	#, Seed: {args['seed']}")
 		print("---------------------------------------")
 		if train == True:
 			a_losses = []
@@ -1021,50 +1038,35 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 				if (i%2000 == 0 and i<10000) or i%10000 == 0:
 					#plot_animated_learnt_policy(test_set, policy,"TD3_BC",  i)
 					#plot_3D_animated_learnt_policy(train_set, policy,"TD3_BC",  i)
-					plot_action_animated_learnt_policy(train_set, policy,"TD3_BC",  i, data_folder)
+					plot_action_animated_learnt_policy(train_set, policy, agent,  i, data_folder)
 
 				if (i%1000 == 0 and i<10000) or i%5000 == 0:
 					#evaluate_agent_performance(test_set, policy)
-					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "TD3_BC",i, action_dim, data_folder)
+					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, agent,i, action_dim, data_folder)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
-					if data_folder == "data":
-						policy.save("models/TD3_BC/TD3_BC_policy")
-					else:
-						policy.save("models/TD3_BC_original/TD3_BC_policy")
+					policy.save('models/TD3_BC'+data_folder+'/TD3_BC_policy')
 				
 			_, evaluation_loss_curve = plt.subplots()
 			evaluation_loss_curve.plot(evaluation_losses)
-			if data_folder == "data":
-				plt.savefig('training_plots/TD3_BC/evaluation_losses_during_training.png')
-			else:
-				plt.savefig('training_plots/TD3_BC_original/evaluation_losses_during_training.png')
+			plt.savefig('training_plots/TD3_BC'+data_folder+'/evaluation_losses_during_training.png')
 
 			_, actor_loss_curve = plt.subplots()
 			actor_loss_curve.plot(a_losses)
-			if data_folder == "data":
-				plt.savefig('training_plots/TD3_BC/actor_losses_training_curve.png')
-			else:
-				plt.savefig('training_plots/TD3_BC_original/actor_losses_training_curve.png')
+			plt.savefig('training_plots/TD3_BC'+data_folder+'/actor_losses_training_curve.png')
 
 			_, critic_loss_curve = plt.subplots()
 			critic_loss_curve.plot(c_losses)
-			if data_folder == "data":
-				plt.savefig('training_plots/TD3_BC/critic_losses_training_curve.png')
-			else:
-				plt.savefig('training_plots/TD3_BC_original/critic_losses_training_curve.png')
+			plt.savefig('training_plots/TD3_BC'+data_folder+'/critic_losses_training_curve.png')
 
 		else:
 			print("load trained model")
-			if data_folder == "data":
-				policy.load("models/TD3_BC/TD3_BC_policy")
-			else:
-				policy.load("models/TD3_BC_original/TD3_BC_policy")
+			policy.load('models/TD3_BC'+data_folder+'/TD3_BC_policy')
 
-	elif model == "AC_Off_POC_TD3":
+	elif agent == "AC_Off_POC_TD3":
 		# Initialize Agent
 		policy = AC_Off_POC_TD3(**kwargs) 
 		print("---------------------------------------")
-		print(f"Policy: {model}")	#, Seed: {args['seed']}")
+		print(f"Policy: {agent}")	#, Seed: {args['seed']}")
 		print("---------------------------------------")
 		if train == True:
 			a_losses = []
@@ -1081,80 +1083,82 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 				c_losses.append(c_loss)
                 
 				if i%2000 == 0:
-					plot_action_animated_learnt_policy(train_set, policy,"AC_Off_POC_TD3",  i)
+					plot_action_animated_learnt_policy(train_set, policy,agent,  i)
 
 				if i%50 == 0:
-					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "AC_Off_POC_TD3",i, action_dim = action_dim)
+					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, agent,i, action_dim = action_dim)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
-					policy.save("models/AC_Off_POC_TD3/AC_Off_POC_TD3_policy")
+					policy.save('models/AC_Off_POC_TD3'+data_folder+'/AC_Off_POC_TD3_policy')
 			
 			_, evaluation_loss_curve = plt.subplots()
 			evaluation_loss_curve.plot(evaluation_losses)
-			plt.savefig('training_plots/AC_Off_POC_TD3/evaluation_losses_during_training.png')
+			plt.savefig('training_plots/AC_Off_POC_TD3'+data_folder+'/evaluation_losses_during_training.png')
 
 			_, actor_loss_curve = plt.subplots()
 			actor_loss_curve.plot(a_losses)
-			plt.savefig('training_plots/AC_Off_POC_TD3/actor_losses_training_curve.png')
+			plt.savefig('training_plots/AC_Off_POC_TD3'+data_folder+'/actor_losses_training_curve.png')
 
 			_, critic_loss_curve = plt.subplots()
 			critic_loss_curve.plot(c_losses)
-			plt.savefig('training_plots/AC_Off_POC_TD3/critic_losses_training_curve.png')
+			plt.savefig('training_plots/AC_Off_POC_TD3'+data_folder+'/critic_losses_training_curve.png')
 		else:
 			print("load trained model")
-			policy.load("models/AC_Off_POC_TD3/TD3_BC_policy")
+			policy.load('models/AC_Off_POC_TD3'+data_folder+'/TD3_BC_policy')
 	else:
-		print(model, "is not implemented")
+		print(agent, "is not implemented")
 		policy=None
 	return policy
 ######################### Evaluation ####################################
-def evaluate_agent_performance(dataset, policy, model="TD3_BC"):
+def evaluate_agent_performance(dataset, policy, agent="TD3_BC"):
 	rewards = []
 	rewards_human = []
 	radius = 0.005
-	vertical_margin = 0.01
+	vertical_margin = 0.001
 
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
 		states, actions, new_states, reward_, terminals= get_trajectory(dataset, trial)
 		
 		state = states[0][:]
 		
-		if model == "CQL_SAC":
+		if agent == "CQL_SAC":
 			actions = policy.select_action(states[0,:], eval=True)
 		else:
 			actions = policy.select_action(states[0,:])
-		cuevel = actions[1:]
-		state = states[0,:].detach().numpy()
+		cuevel = actions[1:].cpu().detach().numpy()
+		angle = actions[0].cpu().detach().numpy()
+		state = states[0,:].cpu().detach().numpy()
 		state_cueball = state[0:3]
 		state_cue_front = state[12:15]
 		state_cue_back = state[15:18]
-		reward_human = reward_[terminals == True]
+		reward_human = reward_[terminals == True].cpu().detach().numpy()
 		reward = 0.0
 		for k in range(states.shape[0]):
 			#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-			next_state_cue_front, next_state_cue_back, next_state_cue_direction = update_cuepos(state_cue_front, actions.detach().numpy())
-			if (next_state_cue_front[0] - state_cueball[0])**2 + (next_state_cue_front[2] - state_cueball[2])**2 < radius \
-			and next_state_cue_front[1] < state_cueball[1] + vertical_margin:
-				
-				next_state_cueball = update_cueballpos(state_cueball, cuevel)
-				states[k][0:3] = next_state_cueball
-				reward = compute_reward_evaluation(cuevel, state[9:12], reward)
-			states[k][21:] = cuevel
-			states[k][12:15] = next_state_cue_front
-			states[k][15:18] = next_state_cue_back
-			states[k][18:21] = next_state_cue_direction
-			states[k][21:] = actions[1:]
-			if model == "CQL_SAC":
+			state_cue_front, state_cue_back, state_cue_direction = update_cuepos(state_cue_front, actions.cpu().detach().numpy(), call="evaluation")
+			if (state_cue_front[0] - state_cueball[0])**2 + (state_cue_front[2] - state_cueball[2])**2 < radius \
+			and state_cue_front[1] < state_cueball[1] + vertical_margin:
+				#next_state_cueball = update_cueballpos(state_cueball, cuevel)
+				#states[k][0:3] = next_state_cueball
+				reward = compute_reward_evaluation(angle, state[9:12], reward)	#cuevel
+			states[k][12:15] = state_cue_front
+			states[k][15:18] = state_cue_back
+			states[k][18:21] = state_cue_direction
+			#states[k][21:] = actions[1:]
+			if agent == "CQL_SAC":
 				actions = policy.select_action(states[k,:], eval=True)
 			else:
 				actions = policy.select_action(states[k,:])
-			cuevel = actions[1:].detach().numpy()
+			cuevel = actions[1:].cpu().detach().numpy()
+			angle = actions[0].cpu().detach().numpy()
 		rewards = np.append(rewards, reward)
 		rewards_human = np.append(rewards_human, reward_human)
-	print("number of successful trials agent: ", np.count_nonzero(rewards), rewards)
-	print("number of successful trials human subject: ", np.count_nonzero(rewards_human+10), rewards_human)
+	avg_rewards = np.sum(rewards)/len(rewards)
+	avg_rewards_human = np.sum(rewards_human)/len(rewards_human)
+	print("number of successful trials agent: ", avg_rewards, np.count_nonzero(rewards), rewards)
+	print("number of successful trials human subject: ", avg_rewards_human, np.count_nonzero(rewards_human), rewards_human)
 
 			
-def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration=44, action_dim=3, data_folder="data"):
+def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration=44, action_dim=3, data_folder=""):
 	#losses = []
 	#avg_loss = 0.0
 
@@ -1192,7 +1196,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 		states, actions, new_states, reward, terminals= get_trajectory(dataset, trial)
 		if len(states) == 140:
 			if torch.any(terminals) == True:
-				if reward[terminals] != -10.0:
+				if reward[terminals] != 0.0:
 					count_successful_trajectory += 1
 					successful_trajectory = np.append(successful_trajectory, i)
 					## loss
@@ -1211,7 +1215,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 
 					for k in range(states.size(dim=0)):
 						#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-						if model == "CQL_SAC":
+						if agent == "CQL_SAC":
 							pi_e = policy.select_action(states[k][:], eval=True)
 						else:
 							pi_e = policy.select_action(states[k][:])
@@ -1244,7 +1248,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 					epoch_loss_ = np.append(epoch_loss_ , epoch_loss)
 
 				
-				elif reward[terminals] == -10.0:
+				elif reward[terminals] == 0.0:
 					count_unsuccessful_trajectory += 1
 					unsuccessful_trajectory = np.append(unsuccessful_trajectory, i)
 					## loss
@@ -1261,7 +1265,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 
 					for k in range(states.size(dim=0)):
 						#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-						if model == "CQL_SAC":
+						if agent == "CQL_SAC":
 							pi_e_u = policy.select_action(states[k][:], eval=True)
 						else:
 							pi_e_u = policy.select_action(states[k][:])
@@ -1308,10 +1312,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
 		mean_b.plot(X_u, angle_b_u_[i*140:(i+1)*140], color='blue')
 		mean_b.plot(X_u, angle_e_u_[i*140:(i+1)*140], color='red')
-	if data_folder == "data":
-		fig.savefig('training_plots/'+model+'/iter_'+str(iteration)+'_angle_behaviour_agent.png')
-	else:
-		fig.savefig('training_plots/'+model+'_original/iter_'+str(iteration)+'_angle_behaviour_agent.png')
+	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_angle_behaviour_agent.png')
 
 	fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
@@ -1325,10 +1326,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
 		mean_b.plot(X_u, vel_x_b_u_[i*140:(i+1)*140], color='blue')
 		mean_b.plot(X_u, vel_x_e_u_[i*140:(i+1)*140], color='red')
-	if data_folder == "data":
-		fig.savefig('training_plots/'+model+'/iter_'+str(iteration)+'_vel_x_behaviour_agent.png')
-	else:
-		fig.savefig('training_plots/'+model+'_original/iter_'+str(iteration)+'_vel_x_behaviour_agent.png')
+	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_vel_x_behaviour_agent.png')
 
 	fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
@@ -1342,10 +1340,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
 		mean_b.plot(X_u, vel_z_b_u_[i*140:(i+1)*140], color='blue')
 		mean_b.plot(X_u, vel_z_e_u_[i*140:(i+1)*140], color='red')
-	if data_folder == "data":
-		fig.savefig('training_plots/'+model+'/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')
-	else:
-		fig.savefig('training_plots/'+model+'_original/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')
+	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')
 
 	fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
@@ -1358,16 +1353,13 @@ def evaluate_close_to_human_behaviour(dataset, policy, model="TD3_BC", iteration
 		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
 		mean_b.plot(X_u, epoch_loss_u_[i*140:(i+1)*140], color='red')
 	#fig.tight_layout()
-	if data_folder == "data":
-		fig.savefig('training_plots/'+model+'/iter_'+str(iteration)+'_MSE_loss_between_actions.png')
-	else:
-		fig.savefig('training_plots/'+model+'_original/iter_'+str(iteration)+'_MSE_loss_between_actions.png')
+	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_MSE_loss_between_actions.png')
 
 	plt.close('all')
 	return loss/len(dataset["trial"])
 
 
-def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteration=44, data_folder="data"):
+def plot_action_animated_learnt_policy(dataset, policy, agent="TD3_BC", iteration=44, data_folder=""):
 
 	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[iteration])
 	fig, ax = plt.subplots(1,1)
@@ -1386,14 +1378,14 @@ def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteratio
 	cuedirection[0][1] = states[0,19]
 	cuedirection[0][2] = states[0,20]
 
-	if model == "CQL_SAC":
+	if agent == "CQL_SAC":
 		actions = policy.select_action(states[0,:], eval=True)
 	else:
 		actions = policy.select_action(states[0,:])
 	
 	#vel = [0,0,0]
-	for i in range(1, states.shape[0]-1):
-		cueposfront[i][:] , cueposback[i][:], cuedirection[i][:] = update_cuepos(cueposfront[i-1][:], actions.detach().numpy())
+	for i in range(states.shape[0]):
+		cueposfront[i][:] , cueposback[i][:], cuedirection[i][:] = update_cuepos(cueposfront[i][:], actions.detach().numpy(), call="plot")		#, vel, vel)
 		#cueposfront[i][:] , cueposback[i][:], vel = update_cuepos(cueposfront[i-1][:],vel, actions)
 		#cueposfront2[i][:] = actions[:3]
 		#cueposback2[i][:] = actions[3:6]
@@ -1407,10 +1399,10 @@ def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteratio
 		states[i,18] = cuedirection[i][0]
 		states[i,19] = cuedirection[i][1]
 		states[i,20] = cuedirection[i][2]
-		states[i,21] = actions[1]
-		states[i,22] = actions[2]
-		states[i,23] = actions[3]
-		if model == "CQL_SAC":
+		#states[i,21] = actions[1]
+		#states[i,22] = actions[2]
+		#states[i,23] = actions[3]
+		if agent == "CQL_SAC":
 			actions = policy.select_action(states[i,:], eval=True)
 		else:
 			actions = policy.select_action(states[i,:])
@@ -1451,46 +1443,60 @@ def plot_action_animated_learnt_policy(dataset, policy, model="TD3_BC", iteratio
 
 	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=40, repeat=False)	
 	plt.close()
-	if data_folder == "data":
-		anim.save('training_plots/'+model+'/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')	
-	else:
-		anim.save('training_plots/'+model+'_original/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')
+	anim.save('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')	
 
 
 ########################## Main  ########################################
 
 if __name__ == "__main__":
+	data_folder = "_original"	#"_original" #"_acc"	
+	agent = "TD3_BC"		#"CQL_SAC"	#"TD3_BC"
+	filename = ["data"+data_folder+"/AAB_Offline_reduced.csv", "data"+data_folder+"/AE_Offline_reduced.csv", "data"+data_folder+"/AK_Offline_reduced.csv",
+            "data"+data_folder+"/AS_Offline_reduced.csv", "data"+data_folder+"/BL_Offline_reduced.csv", "data"+data_folder+"/BR_Offline_reduced.csv",
+            "data"+data_folder+"/BY_Offline_reduced.csv", "data"+data_folder+"/CP_Offline_reduced.csv", "data"+data_folder+"/CX_Offline_reduced.csv",
+            "data"+data_folder+"/DR_Offline_reduced.csv", "data"+data_folder+"/DS_Offline_reduced.csv", "data"+data_folder+"/DZ_Offline_reduced.csv",
+            "data"+data_folder+"/ES_Offline_reduced.csv", "data"+data_folder+"/ESS_Offline_reduced.csv", "data"+data_folder+"/GS_Offline_reduced.csv",
+            "data"+data_folder+"/HL_Offline_reduced.csv", "data"+data_folder+"/HZ_Offline_reduced.csv", "data"+data_folder+"/IK_Offline_reduced.csv",
+            "data"+data_folder+"/JG_Offline_reduced.csv", "data"+data_folder+"/JH_Offline_reduced.csv", "data"+data_folder+"/JR_Offline_reduced.csv",
+            "data"+data_folder+"/JW_Offline_reduced.csv", "data"+data_folder+"/JY_Offline_reduced.csv", "data"+data_folder+"/KO_Offline_reduced.csv",
+            "data"+data_folder+"/LR_Offline_reduced.csv", "data"+data_folder+"/MA_Offline_reduced.csv", "data"+data_folder+"/MAI_Offline_reduced.csv",
+			"data"+data_folder+"/MG_Offline_reduced.csv", "data"+data_folder+"/MO_Offline_reduced.csv", "data"+data_folder+"/PM_Offline_reduced.csv",
+            "data"+data_folder+"/RA_Offline_reduced.csv", "data"+data_folder+"/SC_Offline_reduced.csv", "data"+data_folder+"/SF_Offline_reduced.csv",
+			"data"+data_folder+"/TA_Offline_reduced.csv", "data"+data_folder+"/TH_Offline_reduced.csv", "data"+data_folder+"/TS_Offline_reduced.csv",
+            "data"+data_folder+"/VB_Offline_reduced.csv", "data"+data_folder+"/WZ_Offline_reduced.csv", "data"+data_folder+"/YC_Offline_reduced.csv",
+            "data"+data_folder+"/YH_Offline_reduced.csv"]
+	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"]
+	"""["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/CP_Offline_reduced.csv", "RL_dataset/Offline_reduced/CX_Offline_reduced.csv", 
+			"RL_dataset/Offline_reduced/GS_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/JW_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/KO_Offline_reduced.csv", "RL_dataset/Offline_reduced/LR_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/MA_Offline_reduced.csv", "RL_dataset/Offline_reduced/MAI_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/MG_Offline_reduced.csv", "RL_dataset/Offline_reduced/MO_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/PM_Offline_reduced.csv", "RL_dataset/Offline_reduced/SC_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/SF_Offline_reduced.csv", "RL_dataset/Offline_reduced/TA_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/TH_Offline_reduced.csv", "RL_dataset/Offline_reduced/TS_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/VB_Offline_reduced.csv", "RL_dataset/Offline_reduced/WZ_Offline_reduced.csv",
+			"RL_dataset/Offline_reduced/YC_Offline_reduced.csv", "RL_dataset/Offline_reduced/YH_Offline_reduced.csv"]"""
 
-	filename = ["data/AAB_Offline_reduced.csv", "data/AE_Offline_reduced.csv", "data/AK_Offline_reduced.csv",
-            "data/AS_Offline_reduced.csv", "data/BL_Offline_reduced.csv", "data/BR_Offline_reduced.csv",
-            "data/BY_Offline_reduced.csv", "data/CP_Offline_reduced.csv", "data/CX_Offline_reduced.csv",
-            "data/DR_Offline_reduced.csv", "data/DS_Offline_reduced.csv", "data/DZ_Offline_reduced.csv",
-            "data/ES_Offline_reduced.csv", "data/ESS_Offline_reduced.csv", "data/GS_Offline_reduced.csv",
-            "data/HL_Offline_reduced.csv", "data/HZ_Offline_reduced.csv", "data/IK_Offline_reduced.csv",
-            "data/JG_Offline_reduced.csv", "data/JH_Offline_reduced.csv", "data/JR_Offline_reduced.csv",
-            "data/JW_Offline_reduced.csv", "data/JY_Offline_reduced.csv", "data/KO_Offline_reduced.csv",
-            "data/LR_Offline_reduced.csv", "data/MA_Offline_reduced.csv", "data/MAI_Offline_reduced.csv",
-			"data/MG_Offline_reduced.csv", "data/MO_Offline_reduced.csv", "data/PM_Offline_reduced.csv",
-            "data/RA_Offline_reduced.csv", "data/SC_Offline_reduced.csv", "data/SF_Offline_reduced.csv",
-			"data/TA_Offline_reduced.csv", "data/TH_Offline_reduced.csv", "data/TS_Offline_reduced.csv",
-            "data/VB_Offline_reduced.csv", "data/WZ_Offline_reduced.csv", "data/YC_Offline_reduced.csv",
-            "data/YH_Offline_reduced.csv"]
+	"""["data"+data_folder+"/AAB_Offline_reduced.csv", "data"+data_folder+"/AE_Offline_reduced.csv", "data"+data_folder+"/AK_Offline_reduced.csv",
+            "data"+data_folder+"/AS_Offline_reduced.csv", "data"+data_folder+"/BL_Offline_reduced.csv", "data"+data_folder+"/BR_Offline_reduced.csv",
+            "data"+data_folder+"/BY_Offline_reduced.csv", "data"+data_folder+"/CP_Offline_reduced.csv", "data"+data_folder+"/CX_Offline_reduced.csv",
+            "data"+data_folder+"/DR_Offline_reduced.csv", "data"+data_folder+"/DS_Offline_reduced.csv", "data"+data_folder+"/DZ_Offline_reduced.csv",
+            "data"+data_folder+"/ES_Offline_reduced.csv", "data"+data_folder+"/ESS_Offline_reduced.csv", "data"+data_folder+"/GS_Offline_reduced.csv",
+            "data"+data_folder+"/HL_Offline_reduced.csv", "data"+data_folder+"/HZ_Offline_reduced.csv", "data"+data_folder+"/IK_Offline_reduced.csv",
+            "data"+data_folder+"/JG_Offline_reduced.csv", "data"+data_folder+"/JH_Offline_reduced.csv", "data"+data_folder+"/JR_Offline_reduced.csv",
+            "data"+data_folder+"/JW_Offline_reduced.csv", "data"+data_folder+"/JY_Offline_reduced.csv", "data"+data_folder+"/KO_Offline_reduced.csv",
+            "data"+data_folder+"/LR_Offline_reduced.csv", "data"+data_folder+"/MA_Offline_reduced.csv", "data"+data_folder+"/MAI_Offline_reduced.csv",
+			"data"+data_folder+"/MG_Offline_reduced.csv", "data"+data_folder+"/MO_Offline_reduced.csv", "data"+data_folder+"/PM_Offline_reduced.csv",
+            "data"+data_folder+"/RA_Offline_reduced.csv", "data"+data_folder+"/SC_Offline_reduced.csv", "data"+data_folder+"/SF_Offline_reduced.csv",
+			"data"+data_folder+"/TA_Offline_reduced.csv", "data"+data_folder+"/TH_Offline_reduced.csv", "data"+data_folder+"/TS_Offline_reduced.csv",
+            "data"+data_folder+"/VB_Offline_reduced.csv", "data"+data_folder+"/WZ_Offline_reduced.csv", "data"+data_folder+"/YC_Offline_reduced.csv",
+            "data"+data_folder+"/YH_Offline_reduced.csv"]"""
+
 	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"] 
-	'''["data_original/AAB_Offline_reduced.csv", "data_original/AE_Offline_reduced.csv", "data_original/AK_Offline_reduced.csv",
-            "data_original/AS_Offline_reduced.csv", "data_original/BL_Offline_reduced.csv", "data_original/BR_Offline_reduced.csv",
-            "data_original/BY_Offline_reduced.csv", "data_original/CP_Offline_reduced.csv", "data_original/CX_Offline_reduced.csv",
-            "data_original/DR_Offline_reduced.csv", "data_original/DS_Offline_reduced.csv", "data_original/DZ_Offline_reduced.csv",
-            "data_original/ES_Offline_reduced.csv", "data_original/ESS_Offline_reduced.csv", "data_original/GS_Offline_reduced.csv",
-            "data_original/HL_Offline_reduced.csv", "data_original/HZ_Offline_reduced.csv", "data_original/IK_Offline_reduced.csv",
-            "data_original/JG_Offline_reduced.csv", "data_original/JH_Offline_reduced.csv", "data_original/JR_Offline_reduced.csv",
-            "data_original/JW_Offline_reduced.csv", "data_original/JY_Offline_reduced.csv", "data_original/KO_Offline_reduced.csv",
-            "data_original/LR_Offline_reduced.csv", "data_original/MA_Offline_reduced.csv", "data_original/MAI_Offline_reduced.csv",
-			"data_original/MG_Offline_reduced.csv", "data_original/MO_Offline_reduced.csv", "data_original/PM_Offline_reduced.csv",
-            "data_original/RA_Offline_reduced.csv", "data_original/SC_Offline_reduced.csv", "data_original/SF_Offline_reduced.csv",
-			"data_original/TA_Offline_reduced.csv", "data_original/TH_Offline_reduced.csv", "data_original/TS_Offline_reduced.csv",
-            "data_original/VB_Offline_reduced.csv", "data_original/WZ_Offline_reduced.csv", "data_original/YC_Offline_reduced.csv",
-            "data_original/YH_Offline_reduced.csv"]'''
 
 	train_set, test_set = load_clean_data(filename)
-	policy = train(train_set, test_set, state_dim=24, action_dim=4, epochs=100000, train=True, model="CQL_SAC", data_folder="data")	#state_dim=16 #TD3_BC #set train=False to load pretrained model
+	policy = train(train_set, test_set, state_dim=21, action_dim=4, epochs=100000, train=True, agent=agent, data_folder=data_folder)	#state_dim=16 #TD3_BC #set train=False to load pretrained model
 
+	evaluate_agent_performance(test_set, policy, agent=agent)
