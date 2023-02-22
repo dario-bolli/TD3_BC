@@ -15,7 +15,84 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
+import wandb
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import gym
+import argparse
+import os
+import d4rl
+
+import utils
+import warnings
+warnings.filterwarnings("ignore")
+######################################################## Eval policy D4RL ######################################################################
+# Runs policy for X episodes and returns D4RL score
+# A fixed seed is used for the eval environment
+def eval_policy(policy, env_name, seed, mean, std, seed_offset=100, eval_episodes=10):
+	eval_env = gym.make(env_name)
+	eval_env.seed(seed + seed_offset)
+
+	avg_reward = 0.
+	for _ in range(eval_episodes):
+		state, done = eval_env.reset(), False
+		while not done:
+			state = (torch.tensor(state, dtype=torch.float).reshape(1,-1) - mean)/std
+			action = policy.select_action(state).squeeze().detach().numpy()
+			state, reward, done, _ = eval_env.step(action)
+			avg_reward += reward
+
+	avg_reward /= eval_episodes
+	d4rl_score = eval_env.get_normalized_score(avg_reward) * 100
+
+	print("---------------------------------------")
+	print(f"Evaluation over {eval_episodes} episodes: {avg_reward:.3f}, D4RL score: {d4rl_score:.3f}")
+	print("---------------------------------------")
+	return avg_reward, d4rl_score
+
+def load_d4rl_scores(filename_d4rl, filename_reward, model):
+	d4rl_score = np.load(filename_d4rl)
+	avg_reward = np.load(filename_reward)
+	print("---------------------------------------")
+	print(f"avg reward:", avg_reward, "D4RL score:", d4rl_score)
+	print("---------------------------------------")
+	
+	_, D4RL_evaluation_curve = plt.subplots()
+	D4RL_evaluation_curve.plot(d4rl_score)
+	plt.savefig('results/'+model+'d4rl_evaluation_score.png')
+	_, avg_reward_evaluation_curve = plt.subplots()
+	avg_reward_evaluation_curve.plot(avg_reward)
+	plt.savefig('results/'+model+'avg_reward_evaluation_score.png')
+
+	plt.close()
+
+def visualize_d4RL_policy(env_name):
+    env = gym.make(env_name)
+
+    seed = 0
+    # Set seeds
+    env.seed(seed)
+    env.action_space.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
+    replay_buffer.convert_D4RL(d4rl.qlearning_dataset(env))
+    mean,std = replay_buffer.normalize_states() 
+
+    dataset = env.get_dataset()
+    if 'infos/qpos' not in dataset:
+        raise ValueError('Only MuJoCo-based environments can be visualized')
+    qpos = dataset['infos/qpos']
+    qvel = dataset['infos/qvel']
+    rewards = dataset['rewards']
+    actions = dataset['actions']
+
+    env.reset()
+    env.set_state(qpos[0], qvel[0])
+    for t in range(qpos.shape[0]):
+        env.set_state(qpos[t], qvel[t])
+        env.render()
 
 ##################################################### Functions ############################################################
 def update_cueballpos(prev_pos, velocity):
@@ -52,14 +129,12 @@ def compute_reward_evaluation(angle, target_corner, reward):	#cuevel
     if target_corner_angle < 90.0:
         angle = 180 - angle
     mean_pocket = 105.0736
-    lbPocket = mean_pocket - 0.5	#0.3106383 #= 104.7629617
-    ubPocket = mean_pocket + 0.5	#0.2543617 #= 105.3279617
+    lbPocket = mean_pocket - 0.32	#0.3106383 #= 104.7629617
+    ubPocket = mean_pocket + 0.26	#0.2543617 #= 105.3279617
 
-    if reward == 100:
-        reward = 100
-    else:
+    if reward != 1.0:
         if angle <= ubPocket and angle >= lbPocket:     #Mathf.Max(currentTargetAngle, 
-            reward = 100
+            reward = 1.0
             print("Funnel")
         else:
             reward = 0
@@ -274,7 +349,7 @@ class Critic(nn.Module):
 		return q1
 
 
-class TD3_BC(object):
+class TD3_BC(nn.Module):
 	def __init__(
 		self,
 		state_dim,
@@ -286,8 +361,8 @@ class TD3_BC(object):
 		noise_clip=0.5,
 		policy_freq=2,
 		alpha=2.5,
-	):
-
+		):
+		super(TD3_BC, self).__init__()
 		self.actor = Actor(state_dim, action_dim, max_action).to(device)
 		self.actor_target = copy.deepcopy(self.actor)
 		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
@@ -316,8 +391,8 @@ class TD3_BC(object):
 
 	def train(self, experience, batch_size=1):
 		self.total_it += 1
-		a_loss = 0.0
-		c_loss = 0.0
+		actor_loss = torch.tensor(0.0, device = device)
+		critic_loss = torch.tensor(0.0, device = device)
 		# Sample replay buffer 
 		#states, actions, new_states, rewards, not_terminals = trajectory.sample(256)
 		states, actions, new_states, rewards, terminals = experience 
@@ -353,7 +428,7 @@ class TD3_BC(object):
 			Q = self.critic.Q1(states, pi)
 			lmbda = self.alpha/Q.abs().mean().detach()
 
-			actor_loss = F.mse_loss(pi, actions) # -lmbda * Q.mean() +
+			actor_loss = -lmbda * Q.mean() + F.mse_loss(pi, actions) 
 			# Optimize the actor 
 			self.actor_optimizer.zero_grad()
 			actor_loss.backward()
@@ -365,11 +440,12 @@ class TD3_BC(object):
 
 			for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
 				target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data) 
-			a_loss += actor_loss.cpu().detach().numpy()
-		c_loss += critic_loss.cpu().detach().numpy()
+			#a_loss += actor_loss.cpu().detach().numpy()
+		#c_loss += critic_loss.cpu().detach().numpy()
 		#self.actor_scheduler.step()
 		#self.critic_scheduler.step()
-		return c_loss, a_loss
+		return  critic_loss.cpu().detach(), actor_loss.cpu().detach()	#c_loss, a_loss
+
 
 	def save(self, filename):
 		torch.save(self.critic.state_dict(), filename + "_critic")	# "_clean" +
@@ -560,16 +636,16 @@ class Actor_CQL(nn.Module):
         self.fc3 = nn.Linear(hidden_size2, hidden_size)
         self.mu = nn.Linear(hidden_size, action_size)
         self.log_std_linear = nn.Linear(hidden_size, action_size)
-        self.dropout = nn.Dropout(0.25)
+        #self.dropout = nn.Dropout(0.25)
         
     def forward(self, state):
 
         x = F.relu(self.fc1(state))
-        x = self.dropout(x)
+        #x = self.dropout(x)
         x = F.relu(self.fc2(x))
-        x = self.dropout(x)
+        #x = self.dropout(x)
         x = F.relu(self.fc3(x))
-        x = self.dropout(x)
+        #x = self.dropout(x)
         mu = self.mu(x)
 
         log_std = self.log_std_linear(x)
@@ -622,7 +698,7 @@ class Critic_CQL(nn.Module):
         self.fc2 = nn.Linear(hidden_size,hidden_size2)
         self.fc3 = nn.Linear(hidden_size2, hidden_size)
         self.fc4 = nn.Linear(hidden_size, 1)
-        self.dropout = nn.Dropout(0.25)
+        #self.dropout = nn.Dropout(0.25)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -635,11 +711,11 @@ class Critic_CQL(nn.Module):
         """Build a critic (value) network that maps (state, action) pairs -> Q-values."""
         x = torch.cat((state, action), dim=-1)
         x = F.relu(self.fc1(x))
-        x = self.dropout(x)
+        #x = self.dropout(x)
         x = F.relu(self.fc2(x))
-        x = self.dropout(x)
+        #x = self.dropout(x)
         x = F.relu(self.fc3(x))
-        x = self.dropout(x)
+        #x = self.dropout(x)
         return self.fc4(x)
 
 class CQLSAC(nn.Module):
@@ -667,10 +743,10 @@ class CQLSAC(nn.Module):
         self.gamma = 0.99
         self.tau = 1e-2
         hidden_size = 256
-        hidden_size2 = 512
-        learning_rate = 6e-5 
-        learning_rate_actor = 1e-4
-        learning_rate_critic = 6e-5
+        hidden_size2 = 256
+        learning_rate = 3e-5
+        learning_rate_actor = 3e-5
+        learning_rate_critic = 3e-4
         self.clip_grad_param = 1
 
         self.target_entropy = -action_size  # -dim(A)
@@ -680,7 +756,7 @@ class CQLSAC(nn.Module):
         self.alpha_optimizer = optim.Adam(params=[self.log_alpha], lr=learning_rate) 
         
         # CQL params
-        self.with_lagrange = False
+        self.with_lagrange = True
         self.temp = 1.0
         self.cql_weight = 1.0
         self.target_action_gap = 0.0
@@ -743,7 +819,7 @@ class CQLSAC(nn.Module):
         random_log_probs = math.log(0.5 ** self.action_size)
         return random_values - random_log_probs
     
-    def train(self, experiences, batch_size=1):
+    def train(self, experiences):
         """Updates actor, critics and entropy_alpha parameters using given batch of experience tuples.
         Q_targets = r + γ * (min_critic_target(next_state, actor_target(next_state)) - α *log_pi(next_action|next_state))
         Critic_loss = MSE(Q, Q_target)
@@ -757,119 +833,118 @@ class CQLSAC(nn.Module):
             gamma (float): discount factor
         """
         # Sample replay buffer 
-        #states, actions, next_states, rewards, not_dones = experiences.sample(512)
-        states, actions, next_states, rewards, dones = experiences
-        not_dones = ~ dones
-        actor_losses_ = []
-        alpha_losses_ = []
-        critic1_losses_ = []
-        critic2_losses_ = []
-        cql1_scaled_losses_ = []
-        cql2_scaled_losses_ = []
+        states, actions, next_states, rewards, not_dones = experiences
+        #states, actions, next_states, rewards, dones = experiences
+        #not_dones = ~ dones
+        actor_losses = torch.tensor(0.0, device = device)
+        alpha_losses = torch.tensor(0.0, device = device)
+        critic1_losses = torch.tensor(0.0, device = device)
+        critic2_losses = torch.tensor(0.0, device = device)
+        cql1_scaled_losses = torch.tensor(0.0, device = device)
+        cql2_scaled_losses = torch.tensor(0.0, device = device)
 
-        for i in range(0, states.size(dim=0), batch_size): 
-            # ---------------------------- update actor ---------------------------- #
-            current_alpha = copy.deepcopy(self.alpha)
-            actor_loss, log_pis = self.calc_policy_loss(states[i:i+batch_size][:], current_alpha)
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
-            
-            # Compute alpha loss
-            alpha_loss = - (self.log_alpha.exp() * (log_pis.cpu() + self.target_entropy).detach().cpu()).mean()
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-            self.alpha = self.log_alpha.exp().detach()
+        # ---------------------------- update actor ---------------------------- #
+        current_alpha = copy.deepcopy(self.alpha)
+        actor_loss, log_pis = self.calc_policy_loss(states, current_alpha)
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        
+        # Compute alpha loss
+        alpha_loss = - (self.log_alpha.exp() * (log_pis.cpu() + self.target_entropy).detach().cpu()).mean()
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+        self.alpha = self.log_alpha.exp().detach()
 
-            # ---------------------------- update critic ---------------------------- #
-            # Get predicted next-state actions and Q values from target models
-            with torch.no_grad():
-                next_action, new_log_pi = self.actor_local.evaluate(next_states[i:i+batch_size][:])
-                Q_target1_next = self.critic1_target(next_states[i:i+batch_size][:], next_action)
-                Q_target2_next = self.critic2_target(next_states[i:i+batch_size][:], next_action)
-                Q_target_next = torch.min(Q_target1_next, Q_target2_next) - self.alpha.to(self.device) * new_log_pi
-                # Compute Q targets for current states (y_i)
-                Q_targets = rewards[i:i+batch_size] + not_dones[i:i+batch_size] * self.gamma * Q_target_next.squeeze()
+        # ---------------------------- update critic ---------------------------- #
+        # Get predicted next-state actions and Q values from target models
+        with torch.no_grad():
+            next_action, new_log_pi = self.actor_local.evaluate(next_states)
+            Q_target1_next = self.critic1_target(next_states, next_action)
+            Q_target2_next = self.critic2_target(next_states, next_action)
+            Q_target_next = torch.min(Q_target1_next, Q_target2_next) - self.alpha.to(self.device) * new_log_pi
+            # Compute Q targets for current states (y_i)
+            Q_targets = rewards + not_dones * self.gamma * Q_target_next
 
 
-            # Compute critic loss
-            q1 = self.critic1(states[i:i+batch_size][:], actions[i:i+batch_size][:])
-            q2 = self.critic2(states[i:i+batch_size][:], actions[i:i+batch_size][:])
+        # Compute critic loss
+        q1 = self.critic1(states, actions)
+        q2 = self.critic2(states, actions)
 
-            critic1_loss = F.mse_loss(q1.squeeze(), Q_targets)
-            critic2_loss = F.mse_loss(q2.squeeze(), Q_targets)
-            
-            # CQL addon
-            random_actions = torch.FloatTensor(q1.shape[0] * 10, actions[i:i+batch_size][:].shape[-1]).uniform_(-1, 1).to(self.device)
-            num_repeat = int (random_actions.shape[0] / states[i:i+batch_size][:].shape[0])
-            temp_states = states[i:i+batch_size][:].unsqueeze(1).repeat(1, num_repeat, 1).view(states[i:i+batch_size][:].shape[0] * num_repeat, states[i:i+batch_size][:].shape[1])
-            temp_next_states = next_states[i:i+batch_size][:].unsqueeze(1).repeat(1, num_repeat, 1).view(next_states[i:i+batch_size][:].shape[0] * num_repeat, next_states[i:i+batch_size][:].shape[1])
-            
-            current_pi_values1, current_pi_values2  = self._compute_policy_values(temp_states, temp_states)
-            next_pi_values1, next_pi_values2 = self._compute_policy_values(temp_next_states, temp_states)
-            
-            random_values1 = self._compute_random_values(temp_states, random_actions, self.critic1).reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
-            random_values2 = self._compute_random_values(temp_states, random_actions, self.critic2).reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
-            
-            current_pi_values1 = current_pi_values1.reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
-            current_pi_values2 = current_pi_values2.reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
+        critic1_loss = F.mse_loss(q1, Q_targets)
+        critic2_loss = F.mse_loss(q2, Q_targets)
+        
+        # CQL addon
+        random_actions = torch.FloatTensor(q1.shape[0] * 10, actions.shape[-1]).uniform_(-1, 1).to(self.device)
+        num_repeat = int (random_actions.shape[0] / states.shape[0])
+        temp_states = states.unsqueeze(1).repeat(1, num_repeat, 1).view(states.shape[0] * num_repeat, states.shape[1])
+        temp_next_states = next_states.unsqueeze(1).repeat(1, num_repeat, 1).view(next_states.shape[0] * num_repeat, next_states.shape[1])
+        
+        current_pi_values1, current_pi_values2  = self._compute_policy_values(temp_states, temp_states)
+        next_pi_values1, next_pi_values2 = self._compute_policy_values(temp_next_states, temp_states)
+        
+        random_values1 = self._compute_random_values(temp_states, random_actions, self.critic1).reshape(states.shape[0], num_repeat, 1)
+        random_values2 = self._compute_random_values(temp_states, random_actions, self.critic2).reshape(states.shape[0], num_repeat, 1)
+        
+        current_pi_values1 = current_pi_values1.reshape(states.shape[0], num_repeat, 1)
+        current_pi_values2 = current_pi_values2.reshape(states.shape[0], num_repeat, 1)
 
-            next_pi_values1 = next_pi_values1.reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
-            next_pi_values2 = next_pi_values2.reshape(states[i:i+batch_size][:].shape[0], num_repeat, 1)
-            
-            cat_q1 = torch.cat([random_values1, current_pi_values1, next_pi_values1], 1)
-            cat_q2 = torch.cat([random_values2, current_pi_values2, next_pi_values2], 1)
-            
-            assert cat_q1.shape == (states[i:i+batch_size][:].shape[0], 3 * num_repeat, 1), f"cat_q1 instead has shape: {cat_q1.shape}"
-            assert cat_q2.shape == (states[i:i+batch_size][:].shape[0], 3 * num_repeat, 1), f"cat_q2 instead has shape: {cat_q2.shape}"
-            
+        next_pi_values1 = next_pi_values1.reshape(states.shape[0], num_repeat, 1)
+        next_pi_values2 = next_pi_values2.reshape(states.shape[0], num_repeat, 1)
+        
+        cat_q1 = torch.cat([random_values1, current_pi_values1, next_pi_values1], 1)
+        cat_q2 = torch.cat([random_values2, current_pi_values2, next_pi_values2], 1)
+        
+        assert cat_q1.shape == (states.shape[0], 3 * num_repeat, 1), f"cat_q1 instead has shape: {cat_q1.shape}"
+        assert cat_q2.shape == (states.shape[0], 3 * num_repeat, 1), f"cat_q2 instead has shape: {cat_q2.shape}"
+        
 
-            cql1_scaled_loss = ((torch.logsumexp(cat_q1 / self.temp, dim=1).mean() * self.cql_weight * self.temp) - q1.mean()) * self.cql_weight
-            cql2_scaled_loss = ((torch.logsumexp(cat_q2 / self.temp, dim=1).mean() * self.cql_weight * self.temp) - q2.mean()) * self.cql_weight
-            
-            cql_alpha_loss = torch.FloatTensor([0.0])
-            cql_alpha = torch.FloatTensor([0.0])
-            if self.with_lagrange:
-                cql_alpha = torch.clamp(self.cql_log_alpha.exp(), min=0.0, max=1000000.0).to(self.device)
-                cql1_scaled_loss = cql_alpha * (cql1_scaled_loss - self.target_action_gap)
-                cql2_scaled_loss = cql_alpha * (cql2_scaled_loss - self.target_action_gap)
+        cql1_scaled_loss = ((torch.logsumexp(cat_q1 / self.temp, dim=1).mean() * self.cql_weight * self.temp) - q1.mean()) * self.cql_weight
+        cql2_scaled_loss = ((torch.logsumexp(cat_q2 / self.temp, dim=1).mean() * self.cql_weight * self.temp) - q2.mean()) * self.cql_weight
+        
+        cql_alpha_loss = torch.FloatTensor([0.0])
+        cql_alpha = torch.FloatTensor([0.0])
+        if self.with_lagrange:
+            cql_alpha = torch.clamp(self.cql_log_alpha.exp(), min=0.0, max=1000000.0).to(self.device)
+            cql1_scaled_loss = cql_alpha * (cql1_scaled_loss - self.target_action_gap)
+            cql2_scaled_loss = cql_alpha * (cql2_scaled_loss - self.target_action_gap)
 
-                self.cql_alpha_optimizer.zero_grad()
-                cql_alpha_loss = (- cql1_scaled_loss - cql2_scaled_loss) * 0.5 
-                cql_alpha_loss.backward(retain_graph=True)
-                self.cql_alpha_optimizer.step()
-            
-            total_c1_loss = critic1_loss + cql1_scaled_loss
-            total_c2_loss = critic2_loss + cql2_scaled_loss
-            
-            
-            # Update critics
-            # critic 1
-            self.critic1_optimizer.zero_grad()
-            total_c1_loss.backward(retain_graph=True)
-            clip_grad_norm_(self.critic1.parameters(), self.clip_grad_param)
-            self.critic1_optimizer.step()
-            # critic 2
-            self.critic2_optimizer.zero_grad()
-            total_c2_loss.backward()
-            clip_grad_norm_(self.critic2.parameters(), self.clip_grad_param)
-            self.critic2_optimizer.step()
+            self.cql_alpha_optimizer.zero_grad()
+            cql_alpha_loss = (- cql1_scaled_loss - cql2_scaled_loss) * 0.5 
+            cql_alpha_loss.backward(retain_graph=True)
+            self.cql_alpha_optimizer.step()
+        
+        total_c1_loss = critic1_loss + cql1_scaled_loss
+        total_c2_loss = critic2_loss + cql2_scaled_loss
+        
+        # Update critics
+        # critic 1
+        self.critic1_optimizer.zero_grad()
+        total_c1_loss.backward(retain_graph=True)
+        clip_grad_norm_(self.critic1.parameters(), self.clip_grad_param)
+        self.critic1_optimizer.step()
+        # critic 2
+        self.critic2_optimizer.zero_grad()
+        total_c2_loss.backward()
+        clip_grad_norm_(self.critic2.parameters(), self.clip_grad_param)
+        self.critic2_optimizer.step()
 
-            # ----------------------- update target networks ----------------------- #
-            self.soft_update(self.critic1, self.critic1_target)
-            self.soft_update(self.critic2, self.critic2_target)
-            
-            ## store losses ##
-            alpha_losses_.append(alpha_loss.item())
-            critic1_losses_.append(critic1_loss.item())
-            critic2_losses_.append(critic2_loss.item())
-            cql1_scaled_losses_.append(cql1_scaled_loss.item())
-            cql2_scaled_losses_.append(cql2_scaled_loss.item())
-            actor_losses_.append(actor_loss.item())
+        # ----------------------- update target networks ----------------------- #
+        self.soft_update(self.critic1, self.critic1_target)
+        self.soft_update(self.critic2, self.critic2_target)
+        
+        ## store losses ##
+        """alpha_losses_.append(alpha_loss.item())
+        critic1_losses_.append(critic1_loss.item())
+        critic2_losses_.append(critic2_loss.item())
+        cql1_scaled_losses_.append(cql1_scaled_loss.item())
+        cql2_scaled_losses_.append(cql2_scaled_loss.item())
+        actor_losses_.append(actor_loss.item())"""
+        #return actor_losses_, alpha_losses_, critic1_losses_, critic2_losses_,cql1_scaled_losses_, cql2_scaled_losses_
+        #return actor_loss.item(), alpha_loss.item(), critic1_loss.item(), critic2_loss.item(), cql1_scaled_loss.item(), cql2_scaled_loss.item()	#, current_alpha, cql_alpha_loss.item(), cql_alpha.item()
+        return actor_loss.cpu().detach(), alpha_loss.cpu().detach(), critic1_loss.cpu().detach(), critic2_loss.cpu().detach(),cql1_scaled_loss.cpu().detach(), cql2_scaled_loss.cpu().detach()
 
-            #actor_loss.item(), alpha_loss.item(), critic1_loss.item(), critic2_loss.item(), cql1_scaled_loss.item(), cql2_scaled_loss.item(), current_alpha, cql_alpha_loss.item(), cql_alpha.item()
-            return actor_losses_, alpha_losses_, critic1_losses_, critic2_losses_,cql1_scaled_losses_, cql2_scaled_losses_
 
     def soft_update(self, local_model , target_model):
         """Soft update model parameters.
@@ -905,14 +980,15 @@ class CQLSAC(nn.Module):
         self.actor_target = copy.deepcopy(self.actor_local)
 
 ######################### Train ####################################
-def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True, agent = "TD3_BC", data_folder = ""):  
+def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, batch_size=256, train=True, agent = "TD3_BC", data_folder = ""):  
 	print("start Training")
 	# Environment State Properties
 	max_action = 1
     # Agent parameters
 	args = {
         # Experiment
-        "policy": "TD3_BC",
+        "policy": agent,
+		"data": data_folder,
         "seed": 0, 
         "eval_freq": 5e3,
         "max_timesteps": 250,   #1e6,
@@ -929,11 +1005,13 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
         # TD3 + BC
         "alpha": 2.5,
         "normalize": True,
-        "state_dim": 14,
-        "action_dim": 3,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
         "max_action": 10,	#different max_action for each dimension of the Action space?
         "discount": 0.99,
         "tau": 0.005,
+		"learning_rate_actor": 3e-5, 
+		"learning_rate_critic": 3e-4,
         }
 
 	kwargs = {
@@ -950,9 +1028,22 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 		"alpha": args['alpha']
 	    }
 
+	### Logs wandb	###
+	
+	wandb.init(project="reward-learning", config=args)
+	
+	#wandb.define_metric("epoch")
+	# define which metrics will be plotted against it
+	wandb.define_metric("actor loss")	#, step_metric="epoch")
+	#wandb.define_metric("critic loss", step_metric="epoch")
+
 	if agent == "CQL_SAC":
 		# Initialize Agent
 		policy = CQLSAC(state_dim,action_dim)
+		
+		# Magic
+		wandb.watch(policy, log_freq=500)
+
 		print("---------------------------------------")
 		print(f"Policy: {agent}")
 		print("---------------------------------------")
@@ -962,21 +1053,47 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			critic2_losses = []
 			cql1_scaled_losses = []
 			cql2_scaled_losses = []
-			policy_losses = []
+			actor_losses = []
 			evaluation_losses = []
             
+			############# D4RL #############
+			evaluations=[]
+			evaluations2=[]
+			env_name = "halfcheetah-medium-v2"
+			env = gym.make(env_name)
+			seed = 0
+			# Set seeds
+			env.seed(seed)
+			env.action_space.seed(seed)
+			torch.manual_seed(seed)
+			np.random.seed(seed)
+
+			replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
+			replay_buffer.convert_D4RL(d4rl.qlearning_dataset(env))
+			mean,std = replay_buffer.normalize_states() 
+			############# D4RL #############
+
 			for i in tqdm(range(1, epochs)):
-				experience = weighted_sample_experience(dataset, sample_size=256)   #trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
-				
-				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(experience, batch_size = 256)	#trajectory
-				alpha_losses.append(alpha_loss)
-				critic1_losses.append(critic1_loss) # + cql1_scaled_loss)
-				critic2_losses.append(critic2_loss) # + cql2_scaled_loss)
-				policy_losses.append(actor_loss)
-				cql1_scaled_losses.append( cql1_scaled_loss)
-				cql2_scaled_losses.append(cql2_scaled_loss)
-				
-				if (i%2000 == 0 and i<10000) or i%10000 == 0:
+				#experience = weighted_sample_experience(dataset, sample_size=256)   #trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
+				experience = replay_buffer.sample(batch_size)
+				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(experience)
+				alpha_losses.append(alpha_loss.numpy())
+				critic1_losses.append(critic1_loss.numpy()) # + cql1_scaled_loss)
+				critic2_losses.append(critic2_loss.numpy()) # + cql2_scaled_loss)
+				actor_losses.append(actor_loss.numpy())
+				cql1_scaled_losses.append( cql1_scaled_loss.numpy())
+				cql2_scaled_losses.append(cql2_scaled_loss.numpy())
+
+				wandb.log({"actor loss": actor_loss, 
+							"critic 1 loss": critic1_loss, 
+							"critic 2 loss": critic2_loss,
+							"alpha loss": alpha_loss,
+							"cql 1 loss": cql1_scaled_loss,
+							"cql 2 loss": cql2_scaled_loss})
+				if i%10000 == 0:
+					eval_reward = eval_policy(policy,env_name, 42, mean,std)
+					wandb.log({"Test Reward": eval_reward})
+				"""if (i%2000 == 0 and i<10000) or i%10000 == 0:
 					plot_action_animated_learnt_policy(train_set, policy,"CQL_SAC",  i, data_folder)
 
 				if (i%1000 == 0 and i<10000) or i%5000 == 0:
@@ -996,9 +1113,9 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			critic2_loss_curve.plot(critic2_losses)
 			plt.savefig('training_plots/CQL_SAC'+data_folder+'/critic2_losses_training_curve.png')
 
-			_, policy_loss_curve = plt.subplots()
-			policy_loss_curve.plot(policy_losses)
-			plt.savefig('training_plots/CQL_SAC'+data_folder+'/policy_losses_training_curve.png')
+			_, actor_loss_curve = plt.subplots()
+			actor_loss_curve.plot(actor_losses)
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/actor_losses_training_curve.png')
 
 			_, evaluation_loss_curve = plt.subplots()
 			evaluation_loss_curve.plot(evaluation_losses)
@@ -1010,7 +1127,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			
 			_, cql2_scaled_loss_curve = plt.subplots()
 			cql2_scaled_loss_curve.plot(cql2_scaled_losses)
-			plt.savefig('training_plots/CQL_SAC'+data_folder+'/cql2_scaled_losses_during_training.png')
+			plt.savefig('training_plots/CQL_SAC'+data_folder+'/cql2_scaled_losses_during_training.png')"""
 
 		else:
 			print("load trained model")
@@ -1019,6 +1136,10 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 	elif agent == "TD3_BC":
 		# Initialize Agent
 		policy = TD3_BC(**kwargs) 
+
+		# Magic
+		wandb.watch(policy, log_freq=500)
+
 		print("---------------------------------------")
 		print(f"Policy: {agent}")	#, Seed: {args['seed']}")
 		print("---------------------------------------")
@@ -1026,15 +1147,18 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 			a_losses = []
 			c_losses = []
 			evaluation_losses = []
-			
+			actor_loss = 0.0
 
 			for i in tqdm(range(1, epochs)):
 				experience = weighted_sample_experience(dataset, sample_size=256)    #weighted_sample(dataset, prob_dist) #sample(dataset) 	  
 				c_loss, a_loss = policy.train(experience, batch_size = 256) #replay_buffer #, args, **kwargs
 				if a_loss != 0.0:	#actor loss updated only once every "policy_freq" update, set to 0 otherwise
-					a_losses.append(a_loss)
-				c_losses.append(c_loss)
-                
+					a_losses.append(a_loss.numpy())
+					actor_loss = a_loss
+				c_losses.append(c_loss.numpy())
+				
+				wandb.log({"actor loss": actor_loss, "critic loss": c_loss})
+
 				if (i%2000 == 0 and i<10000) or i%10000 == 0:
 					#plot_animated_learnt_policy(test_set, policy,"TD3_BC",  i)
 					#plot_3D_animated_learnt_policy(train_set, policy,"TD3_BC",  i)
@@ -1112,7 +1236,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, train=True
 def evaluate_agent_performance(dataset, policy, agent="TD3_BC"):
 	rewards = []
 	rewards_human = []
-	radius = 0.005
+	radius = 0.001
 	vertical_margin = 0.001
 
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
@@ -1132,11 +1256,14 @@ def evaluate_agent_performance(dataset, policy, agent="TD3_BC"):
 		state_cue_back = state[15:18]
 		reward_human = reward_[terminals == True].cpu().detach().numpy()
 		reward = 0.0
-		for k in range(states.shape[0]):
+		#terminals_ind = dataset['trial'][dataset['terminals']==True]
+		for trial in dataset['trial'].unique():
+			hit_ind = dataset['states'][dataset['trial']==trial].indices()[-1]
 			#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
 			state_cue_front, state_cue_back, state_cue_direction = update_cuepos(state_cue_front, actions.cpu().detach().numpy(), call="evaluation")
-			if (state_cue_front[0] - state_cueball[0])**2 + (state_cue_front[2] - state_cueball[2])**2 < radius \
-			and state_cue_front[1] < state_cueball[1] + vertical_margin:
+			#if (state_cue_front[0] - state_cueball[0])**2 + (state_cue_front[2] - state_cueball[2])**2 < radius \
+			#and state_cue_front[1] < state_cueball[1] + vertical_margin:
+			if k >= (hit_ind-2) and k <= (hit_ind+2):
 				#next_state_cueball = update_cueballpos(state_cueball, cuevel)
 				#states[k][0:3] = next_state_cueball
 				reward = compute_reward_evaluation(angle, state[9:12], reward)	#cuevel
@@ -1196,7 +1323,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration
 		states, actions, new_states, reward, terminals= get_trajectory(dataset, trial)
 		if len(states) == 140:
 			if torch.any(terminals) == True:
-				if reward[terminals] != 0.0:
+				if reward[terminals] == 1.0:
 					count_successful_trajectory += 1
 					successful_trajectory = np.append(successful_trajectory, i)
 					## loss
@@ -1449,9 +1576,9 @@ def plot_action_animated_learnt_policy(dataset, policy, agent="TD3_BC", iteratio
 ########################## Main  ########################################
 
 if __name__ == "__main__":
-	data_folder = "_original"	#"_original" #"_acc"	
-	agent = "TD3_BC"		#"CQL_SAC"	#"TD3_BC"
-	filename = ["data"+data_folder+"/AAB_Offline_reduced.csv", "data"+data_folder+"/AE_Offline_reduced.csv", "data"+data_folder+"/AK_Offline_reduced.csv",
+	data_folder = ""	#"_original" #"_acc"	
+	agent = "CQL_SAC"		#"CQL_SAC"	#"TD3_BC"
+	"""filename = ["data"+data_folder+"/AAB_Offline_reduced.csv", "data"+data_folder+"/AE_Offline_reduced.csv", "data"+data_folder+"/AK_Offline_reduced.csv",
             "data"+data_folder+"/AS_Offline_reduced.csv", "data"+data_folder+"/BL_Offline_reduced.csv", "data"+data_folder+"/BR_Offline_reduced.csv",
             "data"+data_folder+"/BY_Offline_reduced.csv", "data"+data_folder+"/CP_Offline_reduced.csv", "data"+data_folder+"/CX_Offline_reduced.csv",
             "data"+data_folder+"/DR_Offline_reduced.csv", "data"+data_folder+"/DS_Offline_reduced.csv", "data"+data_folder+"/DZ_Offline_reduced.csv",
@@ -1464,7 +1591,7 @@ if __name__ == "__main__":
             "data"+data_folder+"/RA_Offline_reduced.csv", "data"+data_folder+"/SC_Offline_reduced.csv", "data"+data_folder+"/SF_Offline_reduced.csv",
 			"data"+data_folder+"/TA_Offline_reduced.csv", "data"+data_folder+"/TH_Offline_reduced.csv", "data"+data_folder+"/TS_Offline_reduced.csv",
             "data"+data_folder+"/VB_Offline_reduced.csv", "data"+data_folder+"/WZ_Offline_reduced.csv", "data"+data_folder+"/YC_Offline_reduced.csv",
-            "data"+data_folder+"/YH_Offline_reduced.csv"]
+            "data"+data_folder+"/YH_Offline_reduced.csv"]"""
 	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"]
 	"""["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
 			"RL_dataset/Offline_reduced/CP_Offline_reduced.csv", "RL_dataset/Offline_reduced/CX_Offline_reduced.csv", 
@@ -1496,7 +1623,9 @@ if __name__ == "__main__":
 
 	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"] 
 
-	train_set, test_set = load_clean_data(filename)
-	policy = train(train_set, test_set, state_dim=21, action_dim=4, epochs=100000, train=True, agent=agent, data_folder=data_folder)	#state_dim=16 #TD3_BC #set train=False to load pretrained model
+	#train_set, test_set = load_clean_data(filename)
+	train_set=0
+	test_set=0
+	policy = train(train_set, test_set, state_dim=17, action_dim=6, epochs=100000, batch_size=256, train=True, agent=agent, data_folder=data_folder)	#state_dim=16 #TD3_BC #set train=False to load pretrained model
 
-	evaluate_agent_performance(test_set, policy, agent=agent)
+	#evaluate_agent_performance(test_set, policy, agent=agent)
