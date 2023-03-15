@@ -21,7 +21,26 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ########################################################################################################################################
 #                                                         Functions
 ########################################################################################################################################
+def compute_actions(cuevel, cueDirection, cueposfront, cueposback):
+    cueAngle = compute_angle(cueDirection)  #min_max_standardisation(, min_val=45, max_val=135)
+    
+    #cueacceleration =  normalize(compute_acceleration(cuevel[["x","y","z"]].to_numpy()))      # min_max_standardisation() #, min_val=-140, max_val=140)
+    shotMagnitude = compute_impulseForce(cuevel, cueDirection)  #min_max_standardisation_acc()
+    actions = np.hstack((cueAngle.reshape(-1,1) , shotMagnitude.reshape(-1,1) ))  #min_max_standardisation_acc(cuevel[["x","y","z"]].to_numpy())))   #, cueacceleration)) #, normalize(cueacceleration))  
+    #vel_x = min_max_standardisation(cuevel[["x"]].to_numpy())
+    #vel_y = min_max_standardisation(cuevel[["y"]].to_numpy())
+    #vel_z = min_max_standardisation(cuevel[["z"]].to_numpy())
+    #actions = np.hstack((cueAngle.reshape(-1,1), cueposfront[["x", "y", "z"]].to_numpy(), cueposback[["x", "y", "z"]].to_numpy(), vel_x, vel_y, vel_z))  #, cuevel.to_numpy())
+    return actions
+
+def compute_angle(cueDirection):
+    cueAngle = np.rad2deg(np.arctan2(cueDirection['z'].values, cueDirection['x'].values))
+    return cueAngle
+
 def compute_impulseForce(cuevel, cuedirection):
+    shotMagnitude = np.linalg.norm(cuevel[["x","y","z"]], axis=1) 
+    return shotMagnitude 
+'''def compute_impulseForce(cuevel, cuedirection):
     impulseForce = np.zeros(cuevel.shape)       #(N,2)
     shotMagnitude = np.zeros(1)
     shotDir = np.zeros(cuedirection.shape)
@@ -43,18 +62,21 @@ def compute_impulseForce(cuevel, cuedirection):
             impulseForce[i][:] = 0
         else:
             impulseForce[i][:] = shotMagnitude[i] * shotDir[i][:]
-    return impulseForce
+    return impulseForce'''
     
-def def_reward(SuccessFunnel_table, SuccessMedian_table):
+def def_reward(Angle_data): #Success, SuccessFunnel_table, SuccessMedian_table):
     print("Reward function")
-    reward = np.zeros(len(SuccessFunnel_table))
-    for i in range(len(SuccessFunnel_table)):
-        if SuccessFunnel_table.iloc[i] == 1:
-            reward[i] = 100
-        elif SuccessMedian_table.iloc[i] == 1:
-            reward[i] = 20
+    reward = np.zeros(len(Angle_data.Trial))
+    
+    for i in range(len(Angle_data.Trial)):
+        if Angle_data['Success'][i] == 1:
+            reward[i] = 1.0
+        elif Angle_data['SuccessFunnel'][i] == 1:
+            reward[i] = 1.0
+        #elif SuccessMedian_table.iloc[i] == 1:     #Agent will not understand reward for trial better than past 10 trials
+            #reward[i] = 20
         else:
-            reward[i] = -10
+            reward[i] = 0.0
 
     return reward
 
@@ -68,7 +90,7 @@ def static_for_n_timesteps(cueballvel, redballvel, timestep, n):
         return True
     else:
         return False
-
+    
 def start_hit_reduced_timesteps(subjData):
     
     print("start hit timesteps function")
@@ -79,33 +101,53 @@ def start_hit_reduced_timesteps(subjData):
     #Find when cue hits cueball
     hit_ind=[]
     start_ind=[]
-    n = 10
+    n = 9
     threshold = 0.06
 
     start_movement = False
 
     prev_trial = 0
+    start_movement_ind = 0
+    window_before_hit = 15  #200
+    window_after_hit = 15   #50
+    count_miss = 1
+
     for i in range(len(cueballPos["trial"])):
         #The first 200 timesteps approximately are calibration and parasite movements
-        if i > 200:   #!= 0:
+        if i > 200:  
             #New trial started
             if cueballPos["trial"].iloc[i] > prev_trial:
-                if static_for_n_timesteps(cueballvel, redballvel, i, n):
+                if cueballPos["trial"].iloc[i]== (len(start_ind) - count_miss):
+                    print("WARNING: no start and hit index defined for trial ", prev_trial)
+                    count_miss += 1
+                if static_for_n_timesteps(cueballvel, redballvel, i, n):    #and in_radius_around_cueball(cueballpos.iloc[i].to_numpy(), cueposfront.iloc[i].to_numpy()):
                     #Wait for cueball vel y-axis and redball vel y-axis to be zero after new trial started
+                    start_movement_ind = i
                     start_movement = True
                     prev_trial = cueballPos["trial"].iloc[i]
-                    
-            if start_movement == True and np.linalg.norm(cueballvel[["x", "z"]].iloc[i].to_numpy()) > threshold:
-                start_ind = np.append(start_ind, i-30)
-                hit_ind = np.append(hit_ind, i+9)   #+1 when selecting from trajectory
-                start_movement = False
 
-    if len(start_ind) != 250 or len(hit_ind) != 250:
+            elif cueballPos["trial"].iloc[i] == prev_trial and start_movement == True:        
+                if np.linalg.norm(cueballvel[["x", "z"]].iloc[i].to_numpy()) > threshold:
+                    if len(start_ind) > 0:
+                        if cueballPos["trial"][i-window_before_hit] != cueballPos["trial"][start_ind[-1]]:
+                            start_ind = np.append(start_ind, i-window_before_hit)
+                        else:
+                            start_ind = np.append(start_ind, start_movement_ind)
+                    else:
+                        start_ind = np.append(start_ind, i-window_before_hit)
+                    #if cueballPos["trial"][start_ind[i]] == cueballPos["trial"][start_ind[i+1]]:
+                        #print("same trial 2 index", start_movement, cueballPos["trial"].iloc[i], prev_trial)
+                    hit_ind = np.append(hit_ind, i+window_after_hit)   #+1 when selecting from trajectory
+                    start_movement = False
+                        
+    if len(start_ind) < 250 or len(hit_ind) < 250:
         print("WARNING: either missed a start-hit index, or a trial was not properly recorded")
-    for i in range(len(start_ind)):
+    for i in range(len(start_ind)-1):
+        if cueballPos["trial"][start_ind[i]] == cueballPos["trial"][start_ind[i+1]]:
+            print("start index ", i, " and start index ", i+1, "have same trial number")
         if start_ind[i] >= hit_ind[i]:
             raise ValueError("start ind > hit_ind", i , start_ind[i], hit_ind[i])
-    return start_ind.astype(int), hit_ind.astype(int)
+    return start_ind, hit_ind#.astype(int)
 
 #################################### Import Data Functions ############################################
 
@@ -212,6 +254,7 @@ def preprocess(dataset):
     dataset['cueposback_str'] = dataset['cueposback'].str.split(',')
     dataset['cuevel_str'] = dataset['cuevel'].str.split(',')
     dataset['cuedirection_str'] = dataset['cuedirection'].str.split(',')
+    dataset['corner1pos_str'] = dataset['corner1pos'].str.split(',')
     dataset['corner5pos_str'] = dataset['corner5pos'].str.split(',')
     dataset['corner6pos_str'] = dataset['corner6pos'].str.split(',')
     
@@ -235,17 +278,17 @@ def preprocess(dataset):
 
 
     ### Standardise w.r.t cue ball initial position and add time and trial number ###
-    x_std, y_std, z_std = cbpos.iloc[0]
-    for df in (cbpos, rbpos, cueposfront, cueposback, corner5pos, corner6pos, stick, gaze):    # cbvel, rbvel, cuedirection, cuevel, 
-        df -= (x_std, y_std, z_std)
+    #x_std, y_std, z_std = cbpos.iloc[0]
+    for df in (cbpos, rbpos, cueposfront, cueposback, corner5pos, corner6pos, stick, gaze, cbvel, rbvel, cuedirection, cuevel):    # cbvel, rbvel, cuedirection, cuevel, 
+        #df -= (x_std, y_std, z_std)
 
         df['trial'] = np.array(dataset['TrialNumber'])
         #df['time'] = np.array(dataset['TrialTime']) 
         #df['timeReal'] = np.array(dataset['GlobalTime'])  
     
     #We don't want to standardize the velocities with respect to cue ball initial position
-    for df in (cbvel, rbvel, cuedirection, cuevel):
-        df['trial'] = np.array(dataset['TrialNumber']).astype(int)
+    #for df in (cbvel, rbvel, cuedirection, cuevel):
+        #df['trial'] = np.array(dataset['TrialNumber']).astype(int)
 
     ### Create a dictionary for saving dataframes and save them ###
     subject = {}
@@ -433,7 +476,7 @@ def resultsMultipleSubjects(path, sub, gameType, pocketSide):
         raise ValueError("Invalid pocket. Expected one of: %s" % pocketChoice)
 
 
-    #print(path, sub)
+    print(path, sub)
     if mode == 'reward':
 
         # Derive path for a specific subject and game type
@@ -460,14 +503,15 @@ def resultsMultipleSubjects(path, sub, gameType, pocketSide):
             # Add data to dataframes previously defined
             dataset[str(initials)]={}
 
-            dataset[str(initials)]["rewards"] = def_reward(subjData["Game"]["Angle"]["SuccessMedian"], subjData["Game"]["Angle"]["SuccessFunnel"])
+            dataset[str(initials)]["rewards"] = def_reward(subjData["Angle"]["Angle"])  #["Success"], subjData["Angle"]["Angle"]["SuccessMedian"], subjData["Angle"]["Angle"]["SuccessFunnel"])
 
 
             dataset[str(initials)]["cueballpos"] = subjData["PreProcessed"]["cbpos"]
             dataset[str(initials)]["cueballvel"] = subjData["PreProcessed"]["cbvel"]
             
-            dataset[str(initials)]["start_ind"], dataset[str(initials)]["hit_ind"] = start_hit_reduced_timesteps(subjData["PreProcessed"])  #start_hit_timesteps(subjData["PreProcessed"])
-        
+            dataset[str(initials)]["start_ind"], dataset[str(initials)]["hit_ind"] = start_hit_reduced_timesteps(subjData["PreProcessed"])  # start_hit_timesteps(subjData["PreProcessed"])     
+            dataset[str(initials)]["start_ind"] = dataset[str(initials)]["start_ind"].astype(int)
+            dataset[str(initials)]["hit_ind"] = dataset[str(initials)]["hit_ind"].astype(int)
             dataset[str(initials)]["redballpos"] = subjData["PreProcessed"]["rbpos"]
             
             if pocketSub == 'Left':
@@ -596,11 +640,12 @@ def resultsMultipleSubjectsAllRound(pathList, gameType, pocketSide):
 
 ############################## Build RL Offline Dataset #########################################
 
-def Offline_Reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2):   #state_dim should be a multiple of 6
+def Offline_reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2):   #state_dim should be a multiple of 6
     
     print("Offline RL Dataset function")
     #number of trial
-    N = len(data["cueballpos"]["trial"]) -1   #len(data[initial]["start_ind"])
+    N = len(data["cueballpos"]["trial"])-1   #len(data[initial]["start_ind"])
+    print(N)
     state_ = []
     new_state_ = []
     action_ = []
@@ -610,7 +655,8 @@ def Offline_Reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2)
 
     state = np.zeros(state_dim)  #np.zeros(21)
     new_state = np.zeros(state_dim)  #np.zeros(21)
-    action = np.zeros(action_dim)
+    #action = np.zeros(13)   #12)
+    #action = np.zeros(action_dim)
     #reward = np.zeros(1)
     #ball_states=6
     #cue_states=6
@@ -618,37 +664,49 @@ def Offline_Reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2)
 
     #Action Velocity, Force?
     #See car 2D -> action space acceleration and cueDirection
-    actions = compute_impulseForce(cuevel[["x", "z"]], cue_data["cuedirection"][["x", "z"]])
-        
+    #actions = compute_actions(cuevel[["x", "z"]], cue_data["cuedirection"][["x", "z"]], cue_data["cueposfront"][["x", "z"]], cue_data["cueposback"][["x", "z"]])
+    actions = compute_actions(cuevel, cue_data["cuedirection"], cue_data["cueposfront"], cue_data["cueposback"])
+   
     for i in range(N):
         count=0
+        #count_action=0
         for x in data:
             state[count] = data[str(x)]["x"].iloc[i]
-            state[count+1] = data[str(x)]["z"].iloc[i]
+            state[count+1] = data[str(x)]["y"].iloc[i]
+            state[count+2] = data[str(x)]["z"].iloc[i]
             new_state[count] = data[str(x)]["x"].iloc[i+1]
-            new_state[count+1] = data[str(x)]["z"].iloc[i+1]
-            count+=2
+            new_state[count+1] = data[str(x)]["y"].iloc[i+1]
+            new_state[count+2] = data[str(x)]["z"].iloc[i+1]
+            count+=3
 
         #Add last j timesteps of the cuepos to states
         #3 observations on x and z axis makes 6 observations
         #for j in range(cue_states_iterations): #Warning if state_dim not multiple of 6, division fail for loop
         for x in cue_data:
-            state[count] = cue_data[str(x)]["x"].iloc[i]#-j]
-            state[count+1] = cue_data[str(x)]["z"].iloc[i]#-j]
-            new_state[count] = cue_data[str(x)]["x"].iloc[i+1]#-j]
-            new_state[count+1] = cue_data[str(x)]["z"].iloc[i+1]#-j]
-            count+=2
-   
+            state[count] = cue_data[str(x)]["x"].iloc[i]
+            state[count+1] = cue_data[str(x)]["y"].iloc[i]
+            state[count+2] = cue_data[str(x)]["z"].iloc[i]
+            new_state[count] = cue_data[str(x)]["x"].iloc[i+1]
+            new_state[count+1] = cue_data[str(x)]["y"].iloc[i+1]
+            new_state[count+2] = cue_data[str(x)]["z"].iloc[i+1]
+            '''if x == "cueposfront" or x == "cueposback" or x == "cuevel":
+                action[count_action] = cue_data[str(x)]["x"].iloc[i+1]
+                action[count_action+1] = cue_data[str(x)]["y"].iloc[i+1]
+                action[count_action+2] = cue_data[str(x)]["z"].iloc[i+1]
+                count_action+=3'''
+            count+=3
+            
         #Action Velocity, Force?
-        action = actions[i][:]
-        #reward = rewards[i]
+        action = actions[i+1][:]  #[count_action:]    #actions[:,i+1] #action is cuepos at t+1
+        reward = rewards.iloc[i]
         
-        if data['cueballpos']['trial'].iloc[i+1] != data['cueballpos']['trial'].iloc[i] or i==N:
-            done_bool = True
-            reward = rewards.iloc[i]
+        if i == N-1:        #No last timestep due to new_states, so advance reward for the last trial
+            done_bool = 1 
+            reward = rewards.iloc[i+1]  
+        elif data['cueballpos']['trial'].iloc[i+1] != data['cueballpos']['trial'].iloc[i]:
+            done_bool = 1   #True
         else:
-            done_bool = False
-            reward=0
+            done_bool = 0   #False
 
         trial_.append(data["cueballpos"]["trial"].iloc[i])
         state_.append(state.copy())
@@ -1202,8 +1260,8 @@ def mse_loss(x, error):
 ############################# Define Path and Load Dataset ######################################
 
 def load_dataset():
-    path = "C:/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 1/"   #/mnt/c
-    path2 = "C:/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 2/"
+    path = "/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 1/"   #/mnt/c
+    path2 = "/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 2/"
     pathlist = [path, path2]
     '''dic for one subject composed of ~1000 timepoints for one shot, 25 shots in one block, and 10 blocks
     First 3 blocks are baseline learning, then 6 blocks of adaptation to perturbation, and one final washout block
@@ -1218,10 +1276,12 @@ def load_dataset():
                     if blockFile.find('Reward') > -1:
                         print(path, initial)
                         data = resultsMultipleSubjects(path, initial, 'reward', 'all')
-                        save_raw_data(data, initial)
-                        save_RL_reduced_dataset(initial)
-def save_raw_data(data, initial):
+                        save_raw_data(data, initial, save_dir="RL_dataset/raw_30t/")
+                        save_RL_reduced_dataset(initial, load_dir="RL_dataset/raw_30t/", save_dir="RL_dataset/RL_30t/")
+
+def save_raw_data(data, initial, save_dir):
     reward_ = []
+    #rewards = []
     cueballpos = []
     cueballvel = []
     redballpos = []
@@ -1230,32 +1290,29 @@ def save_raw_data(data, initial):
     cueposback = []
     cuedirection = []
     cuevel = []
-
     total_len_trajectories = 0
-
+    
     for i in range(data[initial]["start_ind"].shape[0]):
-        for j in range(data[initial]["start_ind"][i], data[initial]["hit_ind"][i]+1, 1):
+        #reward_ = []
+        trial = data[initial]["cueballpos"]["trial"][data[initial]["start_ind"][i]]
+        for j in range(data[initial]["start_ind"][i], data[initial]["hit_ind"][i]):
             total_len_trajectories += 1
-            if j == data[initial]["hit_ind"][i]:
-                done_bool = True
-                reward = data[initial]["rewards"][i]
+            if j == data[initial]["hit_ind"][i]-1:
+                reward = data[initial]["rewards"][trial-1]
             else:
-                done_bool = False
-                ## Discounted reward ##
-                #gamma = 0.9
-                #reward = gamma**(j - data[initial]["hit_ind"][i]) * data[initial]["rewards"][i]
-                reward = 0
+                reward = 0.0
             reward_.append(reward)
-        cueballpos.append(np.array((data[initial]["cueballpos"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueballpos"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueballpos"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueballpos"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1])))
-        cueballvel.append(np.array((data[initial]["cueballvel"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueballvel"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueballvel"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueballvel"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1])))
-        redballpos.append(np.array((data[initial]["redballpos"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["redballpos"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["redballpos"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["redballpos"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1])))
-        targetcornerpos.append(np.array((data[initial]["targetcornerpos"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["targetcornerpos"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["targetcornerpos"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["targetcornerpos"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1])))
-        cueposfront.append(np.array((data[initial]["cueposfront"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueposfront"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueposfront"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueposfront"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1])))
-        cueposback.append(np.array((data[initial]["cueposback"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueposback"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueposback"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cueposback"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1])))
-        cuedirection.append(np.array((data[initial]["cuedirection"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cuedirection"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cuedirection"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cuedirection"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1])))
-        cuevel.append(np.array((data[initial]["cuevel"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cuevel"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cuevel"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1], data[initial]["cuevel"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]+1])))
+        #rewards.append(np.array(reward_))
+        cueballpos.append(np.array((data[initial]["cueballpos"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueballpos"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueballpos"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueballpos"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]])))
+        cueballvel.append(np.array((data[initial]["cueballvel"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueballvel"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueballvel"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueballvel"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]])))
+        redballpos.append(np.array((data[initial]["redballpos"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["redballpos"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["redballpos"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["redballpos"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]])))
+        targetcornerpos.append(np.array((data[initial]["targetcornerpos"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["targetcornerpos"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["targetcornerpos"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["targetcornerpos"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]])))
+        cueposfront.append(np.array((data[initial]["cueposfront"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueposfront"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueposfront"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueposfront"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]])))
+        cueposback.append(np.array((data[initial]["cueposback"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueposback"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueposback"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cueposback"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]])))
+        cuedirection.append(np.array((data[initial]["cuedirection"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cuedirection"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cuedirection"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cuedirection"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]])))
+        cuevel.append(np.array((data[initial]["cuevel"]["trial"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cuevel"]["x"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cuevel"]["y"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]], data[initial]["cuevel"]["z"][data[initial]["start_ind"][i]:data[initial]["hit_ind"][i]])))
 
-    dic = {'rewards': np.array(reward_), 
+    dic = {'rewards': np.array(reward_),     
     'cueballpos': np.zeros(total_len_trajectories, dtype=object),
     'cueballvel': np.zeros(total_len_trajectories, dtype=object),
     'redballpos': np.zeros(total_len_trajectories, dtype=object),
@@ -1266,6 +1323,7 @@ def save_raw_data(data, initial):
     'cuevel': np.zeros(total_len_trajectories, dtype=object)}
 
     transition_num = 0
+    #print("cuballpos shape 1: ", cueballpos[1].shape[1], cueballpos[1].shape, data[initial]["start_ind"][1]-data[initial]["hit_ind"][1], rewards[1].shape)
     for i in range(data[initial]["start_ind"].shape[0]):
             for j in range(cueballpos[i].shape[1]):
                     dic['cueballpos'][transition_num] = [cueballpos[i][0][j],cueballpos[i][1][j], cueballpos[i][2][j], cueballpos[i][3][j]]
@@ -1277,15 +1335,17 @@ def save_raw_data(data, initial):
                     dic['cuedirection'][transition_num] = [cuedirection[i][0][j], cuedirection[i][1][j], cuedirection[i][2][j], cuedirection[i][3][j]]
                     dic['cuevel'][transition_num] = [cuevel[i][0][j], cuevel[i][1][j], cuevel[i][2][j], cuevel[i][3][j]]
                     transition_num += 1
-
             #if i%50 == 0:
                     #print(i)
     pd_dataset = pd.DataFrame.from_dict(dic)
-    pd_dataset.to_csv("RL_dataset/reduced_data/"+initial+"_reduced_data.csv")
+    pd_dataset.to_csv(save_dir+initial+"_30t_data.csv")
+    #pd_dataset.to_csv("RL_dataset/raw_data/"+initial+"_raw_data.csv")
+    #pd_dataset.to_csv("RL_dataset/"+initial+"_raw.csv")
     print("reduced raw data ", initial, " saved")
 
-def save_RL_reduced_dataset(initial):
-        df = pd.read_csv("RL_dataset/reduced_data/"+initial+"_reduced_data.csv", header = 0, \
+def save_RL_reduced_dataset(initial, load_dir, save_dir):
+        df = pd.read_csv(load_dir+initial+"_30t_data.csv", header = 0, #_3t_data\   
+        #df = pd.read_csv("RL_dataset/"+initial+"_raw.csv", header = 0, \
                 names = ['rewards','cueballpos', 'cueballvel','redballpos', 'targetcornerpos', 'cueposfront', 'cueposback', 'cuedirection', 'cuevel'], usecols = [1,2,3,4,5,6,7,8,9], lineterminator = "\n")
         df = df.replace([r'\n', r'\[', r'\]'], '', regex=True) 
         rewards= pd.DataFrame.from_records(np.array(df['rewards'].astype(str).str.split(','))).astype(float)
@@ -1305,10 +1365,11 @@ def save_RL_reduced_dataset(initial):
             }
         cue_data = {'cueposfront': cueposfront,
                 'cueposback': cueposback,
-                'cuedirection': cuedirection
+                'cuedirection': cuedirection,   #'cuevel': cuevel,
                 }
-        dataset = Offline_Reduced(ball_data, cue_data, cuevel, rewards[0])
-        
+        dataset = Offline_reduced(ball_data, cue_data, cuevel, rewards[0],state_dim=21)
+    
+
         new_d = {'trial': dataset["trial"],
                 'states': np.zeros(dataset["states"].shape[0], dtype=object),
                 'actions': np.zeros(dataset["actions"].shape[0], dtype=object),
@@ -1321,8 +1382,10 @@ def save_RL_reduced_dataset(initial):
                 new_d['new_states'][i] = dataset["new_states"][i][:].tolist()
 
         pd_dataset = pd.DataFrame.from_dict(new_d)
-        pd_dataset.to_csv("RL_dataset/Offline_reduced/"+initial+"_Offline_reduced.csv")
-        print(initial, "reduced Offline dataset saved")
+        pd_dataset.to_csv(save_dir+initial+"_30t_data.csv")
+        #pd_dataset.to_csv("RL_dataset/"+initial+".csv")
+        print(initial, "reduced Offline dataset saved in ", save_dir)
+
 ########################################################################################################################################
 #                                                         Training
 ########################################################################################################################################
@@ -1443,7 +1506,7 @@ def train(args, **kwargs):   #config
 ########################################################################################################################################
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser()
+	'''parser = argparse.ArgumentParser()
 	# Experiment
 	parser.add_argument("--policy", default="TD3_BC") #CQL_SAC            # Policy name
 	parser.add_argument("--env", default="hopper-medium-v0")        # OpenAI gym environment name
@@ -1474,7 +1537,7 @@ if __name__ == "__main__":
 		os.makedirs("./results")
 
 	if args.save_model and not os.path.exists("./models"):
-		os.makedirs("./models")
+		os.makedirs("./models")'''
 
 	#train(args)
 	load_dataset()

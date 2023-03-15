@@ -15,6 +15,12 @@ from torch.nn.utils import clip_grad_norm_
 import seaborn as sns
 import matplotlib.pyplot as plt"""
 ################################################### Functions ########################################################################################3
+def compute_actions_2D(cuevel, cueDirection, cueposfront, cueposback):
+    cueAngle = compute_angle(cueDirection) 
+    shotMagnitude = compute_impulseForce_2D(cuevel, cueDirection)  #min_max_standardisation(, min_val=0, max_val=3)
+    actions = np.hstack((cueAngle.reshape(-1,1) , shotMagnitude.reshape(-1,1) ))  #min_max_standardisation_acc(cuevel[["x","y","z"]].to_numpy())))   #, cueacceleration)) #, normalize(cueacceleration))  
+    return actions  
+
 def compute_actions(cuevel, cueDirection, cueposfront, cueposback):
     cueAngle = compute_angle(cueDirection)  #min_max_standardisation(, min_val=45, max_val=135)
     
@@ -71,6 +77,10 @@ def compute_angle(cueDirection):
     cueAngle = np.rad2deg(np.arctan2(cueDirection["z"].values, cueDirection["x"].values))  
     #print("cue Angle Direction: ", cueAngle)
     return cueAngle
+
+def compute_impulseForce_2D(cuevel, cuedirection):
+    shotMagnitude = np.linalg.norm(cuevel[["x","z"]], axis=1)  
+    return shotMagnitude    #, impulseForce
 
 def compute_impulseForce(cuevel, cuedirection):
 
@@ -177,8 +187,8 @@ def start_hit_reduced_timesteps(subjData):
 
     prev_trial = 0
     start_movement_ind = 0
-    window_before_hit = 100  #200
-    window_after_hit = 40   #50
+    window_before_hit = 3   #100  #200
+    window_after_hit = 2    #40   #50
     count_miss = 1
 
     for i in range(len(cueballPos["trial"])):
@@ -678,7 +688,91 @@ def resultsMultipleSubjects(path, sub, gameType, pocketSide):
             
     return dataset
 
-def Offline_reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2):   #state_dim should be a multiple of 6
+def Offline_reduced_2D(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2):   #state_dim should be a multiple of 6
+    
+    print("Offline RL Dataset function")
+    #number of trial
+    N = len(data["cueballpos"]["trial"])-1   #len(data[initial]["start_ind"])
+    print(N)
+    state_ = []
+    new_state_ = []
+    action_ = []
+    reward_ = []
+    done_ = []
+    trial_ = []
+
+    state = np.zeros(state_dim)  #np.zeros(21)
+    new_state = np.zeros(state_dim)  #np.zeros(21)
+    #action = np.zeros(13)   #12)
+    #action = np.zeros(action_dim)
+    #reward = np.zeros(1)
+    #ball_states=6
+    #cue_states=6
+    #cue_states_iterations = int((state_dim-ball_states)/(cue_states))
+
+    #Action Velocity, Force?
+    #See car 2D -> action space acceleration and cueDirection
+    #actions = compute_actions(cuevel[["x", "z"]], cue_data["cuedirection"][["x", "z"]], cue_data["cueposfront"][["x", "z"]], cue_data["cueposback"][["x", "z"]])
+    actions = compute_actions_2D(cuevel, cue_data["cuedirection"], cue_data["cueposfront"], cue_data["cueposback"])
+   
+    for i in range(N):
+        count=0
+        #count_action=0
+        for x in data:
+            state[count] = data[str(x)]["x"].iloc[i]
+            #state[count+1] = data[str(x)]["y"].iloc[i]
+            state[count+1] = data[str(x)]["z"].iloc[i]
+            new_state[count] = data[str(x)]["x"].iloc[i+1]
+            #new_state[count+1] = data[str(x)]["y"].iloc[i+1]
+            new_state[count+1] = data[str(x)]["z"].iloc[i+1]
+            count+=2
+
+        #Add last j timesteps of the cuepos to states
+        #3 observations on x and z axis makes 6 observations
+        #for j in range(cue_states_iterations): #Warning if state_dim not multiple of 6, division fail for loop
+        for x in cue_data:
+            state[count] = cue_data[str(x)]["x"].iloc[i]
+            #state[count+1] = cue_data[str(x)]["y"].iloc[i]
+            state[count+1] = cue_data[str(x)]["z"].iloc[i]
+            new_state[count] = cue_data[str(x)]["x"].iloc[i+1]
+            #new_state[count+1] = cue_data[str(x)]["y"].iloc[i+1]
+            new_state[count+1] = cue_data[str(x)]["z"].iloc[i+1]
+            '''if x == "cueposfront" or x == "cueposback" or x == "cuevel":
+                action[count_action] = cue_data[str(x)]["x"].iloc[i+1]
+                action[count_action+1] = cue_data[str(x)]["y"].iloc[i+1]
+                action[count_action+2] = cue_data[str(x)]["z"].iloc[i+1]
+                count_action+=3'''
+            count+=2
+            
+        #Action Velocity, Force?
+        action = actions[i+1][:] #- actions[i][:]  #delta angle and delta force
+        reward = rewards.iloc[i]
+        
+        if i == N-1:        #No last timestep due to new_states, so advance reward for the last trial
+            done_bool = 1 
+            reward = rewards.iloc[i+1]  
+        elif data['cueballpos']['trial'].iloc[i+1] != data['cueballpos']['trial'].iloc[i]:
+            done_bool = 1   #True
+        else:
+            done_bool = 0   #False
+
+        trial_.append(data["cueballpos"]["trial"].iloc[i])
+        state_.append(state.copy())
+        new_state_.append(new_state.copy())
+        action_.append(action.copy())
+        reward_.append(reward)
+        done_.append(done_bool)
+    
+    return {
+        'trial': np.array(trial_),
+        'states': np.array(state_),
+        'actions': np.array(action_),
+        'new_states': np.array(new_state_),
+        'rewards': np.array(reward_),
+        'terminals': np.array(done_),
+        }
+
+def Offline_reduced(data, cue_data, cuevel, rewards, state_dim=21, action_dim=2):   #state_dim should be a multiple of 6
     
     print("Offline RL Dataset function")
     #number of trial
@@ -735,7 +829,7 @@ def Offline_reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2)
             count+=3
             
         #Action Velocity, Force?
-        action = actions[i+1][:] - actions[i][:]  #delta angle and delta force
+        action = actions[i+1][:] #- actions[i][:]  #delta angle and delta force
         reward = rewards.iloc[i]
         
         if i == N-1:        #No last timestep due to new_states, so advance reward for the last trial
@@ -763,7 +857,7 @@ def Offline_reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2)
         }
 
 
-def save_raw_data(data, initial):
+def save_raw_data(data, initial, save_dir):
     reward_ = []
     #rewards = []
     cueballpos = []
@@ -844,14 +938,14 @@ def save_raw_data(data, initial):
             #if i%50 == 0:
                     #print(i)
     pd_dataset = pd.DataFrame.from_dict(dic)
-    pd_dataset.to_csv("reduced_data/"+initial+"_reduced_data.csv")
+    pd_dataset.to_csv(save_dir+initial+"_3t_data.csv")
     #pd_dataset.to_csv("RL_dataset/raw_data/"+initial+"_raw_data.csv")
     #pd_dataset.to_csv("RL_dataset/"+initial+"_raw.csv")
     print("reduced raw data ", initial, " saved")
     #return pd_dataset, dic
 
-def save_RL_reduced_dataset(initial):
-        df = pd.read_csv("reduced_data/"+initial+"_reduced_data.csv", header = 0, \
+def save_RL_reduced_dataset(initial, save_dir):
+        df = pd.read_csv("data/"+initial+"_3t_data.csv", header = 0, #_3t_data\   
         #df = pd.read_csv("RL_dataset/"+initial+"_raw.csv", header = 0, \
                 names = ['rewards','cueballpos', 'cueballvel','redballpos', 'targetcornerpos', 'cueposfront', 'cueposback', 'cuedirection', 'cuevel'], usecols = [1,2,3,4,5,6,7,8,9], lineterminator = "\n")
         df = df.replace([r'\n', r'\[', r'\]'], '', regex=True) 
@@ -872,9 +966,11 @@ def save_RL_reduced_dataset(initial):
             }
         cue_data = {'cueposfront': cueposfront,
                 'cueposback': cueposback,
-                'cuedirection': cuedirection    #, 'cuevel': cuevel
+                'cuedirection': cuedirection,   #'cuevel': cuevel,
                 }
         dataset = Offline_reduced(ball_data, cue_data, cuevel, rewards[0],state_dim=21)
+        
+        #dataset = Offline_reduced_2D(ball_data, cue_data, cuevel, rewards[0],state_dim=14)
         #dataset = Offline_One(ball_data, cue_data, cuevel, rewards[0])  #rewars[0] to get float value from dataframe
         # Dataframe does not accept 2-d arrays
         # transform 2-d array (n states times 14 dimensions (state)) to 1-d array of list (of length 14)
@@ -894,9 +990,9 @@ def save_RL_reduced_dataset(initial):
                 new_d['new_states'][i] = dataset["new_states"][i][:].tolist()
 
         pd_dataset = pd.DataFrame.from_dict(new_d)
-        pd_dataset.to_csv("data_2_delta/"+initial+"_Offline_reduced.csv")
+        pd_dataset.to_csv(save_dir+initial+"_3t_left.csv")
         #pd_dataset.to_csv("RL_dataset/"+initial+".csv")
-        print(initial, "reduced Offline dataset saved")
+        print(initial, "reduced Offline dataset saved in ", save_dir)
 
 if __name__ == "__main__":
     ############################# Define Path and Load Dataset ######################################
@@ -911,22 +1007,22 @@ if __name__ == "__main__":
     First 3 blocks are baseline learning, then 6 blocks of adaptation to perturbation, and one final washout block
     That is 250 shots per subjects, 300'564 points in the dictionnary'''
 
-    # Environment State Properties				
-    for path in pathlist:
+    # Environment State Properties	
+    for path in pathlist:			
         for i, initial in enumerate(sorted(os.listdir(path))):
-            if initial == "DR":
-                pathSubj = path + str(initial)
-                for fil in range(len(sorted(os.listdir(pathSubj + '/Game/')))):
-                    if sorted(os.listdir(pathSubj + '/Game/'))[fil].find("Block2") > -1:
-                        blockFile = sorted(os.listdir(pathSubj + '/Game/'))[fil]
+            pathSubj = path + str(initial)
+            for fil in range(len(sorted(os.listdir(pathSubj + '/Game/')))):
+                if sorted(os.listdir(pathSubj + '/Game/'))[fil].find("Block2") > -1:
+                    blockFile = sorted(os.listdir(pathSubj + '/Game/'))[fil]
+                    
+                    if blockFile.find('Reward') > -1:
+                        if blockFile.find('Left') > -1:
+                        #funnel_reward, targetball_reward = get_subjects_reward(path, initial, 'reward', 'all')
+
+                        #pd.DataFrame(funnel_reward).to_csv("D/Rewards/"+initial+"_funnel_rewards.csv")
+                        #pd.DataFrame(targetball_reward).to_csv("D/Rewards/"+initial+"_targetball_rewards.csv")
                         
-                        if blockFile.find('Reward') > -1:
-                            #funnel_reward, targetball_reward = get_subjects_reward(path, initial, 'reward', 'all')
 
-                            #pd.DataFrame(funnel_reward).to_csv("D/Rewards/"+initial+"_funnel_rewards.csv")
-                            #pd.DataFrame(targetball_reward).to_csv("D/Rewards/"+initial+"_targetball_rewards.csv")
-                            
-
-                            data = resultsMultipleSubjects(path, initial, 'reward', 'all')
-                            save_raw_data(data, initial)
-                            save_RL_reduced_dataset(initial)
+                        #data = resultsMultipleSubjects(path, initial, 'reward', 'all')
+                        #save_raw_data(data, initial, save_dir="data/")
+                            save_RL_reduced_dataset(initial, save_dir="data_original_left/")

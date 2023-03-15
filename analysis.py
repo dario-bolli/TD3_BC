@@ -1,17 +1,5 @@
 import os
-import tqdm
-import math
 import numpy as np
-import csv
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.distributions import Normal
-from torch.nn.utils import clip_grad_norm_
-import seaborn as sns
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 import pandas as pd
 
 ########################################### Functions ######################################################################
@@ -170,7 +158,7 @@ def Offline_reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2)
             count+=3
             
         #Action Velocity, Force?
-        action = actions[i+1][:] - actions[i][:]  #delta angle and delta force
+        action = actions[i+1][:] #- actions[i][:]  #delta angle and delta force
         reward = rewards.iloc[i]
         
         if i == N-1:        #No last timestep due to new_states, so advance reward for the last trial
@@ -198,7 +186,7 @@ def Offline_reduced(data, cue_data, cuevel, rewards, state_dim=14, action_dim=2)
         }
 
 def save_RL_reduced_dataset(initial):
-        df = pd.read_csv("RL_dataset/reduced_data/"+initial+"_reduced_data.csv", header = 0, \
+        df = pd.read_csv("data/"+initial+"_3t_data.csv", header = 0, \
         #df = pd.read_csv("RL_dataset/"+initial+"_raw.csv", header = 0, \
                 names = ['rewards','cueballpos', 'cueballvel','redballpos', 'targetcornerpos', 'cueposfront', 'cueposback', 'cuedirection', 'cuevel'], usecols = [1,2,3,4,5,6,7,8,9], lineterminator = "\n")
         df = df.replace([r'\n', r'\[', r'\]'], '', regex=True) 
@@ -241,7 +229,7 @@ def save_RL_reduced_dataset(initial):
                 new_d['new_states'][i] = dataset["new_states"][i][:].tolist()
 
         pd_dataset = pd.DataFrame.from_dict(new_d)
-        pd_dataset.to_csv("RL_dataset/Offline_reduced_2_delta/"+initial+"_Offline_reduced.csv")
+        pd_dataset.to_csv("data_original/"+initial+"_Offline_reduced.csv")
         #pd_dataset.to_csv("RL_dataset/"+initial+".csv")
         print(initial, "reduced Offline dataset saved")    
  #################################################################################################################
@@ -262,13 +250,12 @@ def define_rewards(dataset):
     #cuevel = compute_cuevel(dataset["states"][[12,13,14]])
     #cue_acceleration = compute_acceleration(cuevel)
     
-    
     terminals_ind = dataset["trial"][dataset["terminals"]==True]
     for i in dataset["trial"].unique():
         
-        hit_ind = terminals_ind[terminals_ind == i].index.values -40
-        end_funnel = terminals_ind[terminals_ind == i].index.values -30
-        start_funnel = end_funnel-25
+        hit_ind = terminals_ind[terminals_ind == i].index.values -2 #40
+        end_funnel = terminals_ind[terminals_ind == i].index.values #-30
+        start_funnel = end_funnel-3 #25
 
         for j in dataset["trial"][dataset["trial"] == i].index.values:#range(start_funnel, end_funnel+1):
             if j != terminals_ind[terminals_ind == i].index.values:
@@ -281,32 +268,51 @@ def define_rewards(dataset):
 
                 if j >= start_funnel and j < end_funnel:
                     ## Hitting ball reward
-                    if j+1 > hit_ind - 2 and j+1 < hit_ind + 1:
-                        if (dataset["states"][12].iloc[j+1]-dataset["states"][0].iloc[j+1])**2 + (dataset["states"][13].iloc[j+1]-dataset["states"][1].iloc[j+1])**2\
-                            + (dataset["states"][14].iloc[j+1]-dataset["states"][2].iloc[j+1])**2 < radius: 
-                            dataset["rewards"].iloc[j] += 0.03
-                        
-                        ## Angle funnel around hitting reward
-                        if angle >= lo_bound_angle and angle <= up_bound_angle:
-                            dataset["rewards"].iloc[j] += 0.4
+                    #if j+1 > hit_ind - 2 and j+1 < hit_ind + 1:
+                    if (dataset["states"][12].iloc[j+1]-dataset["states"][0].iloc[j+1])**2 + (dataset["states"][13].iloc[j+1]-dataset["states"][1].iloc[j+1])**2\
+                        + (dataset["states"][14].iloc[j+1]-dataset["states"][2].iloc[j+1])**2 < radius: 
+                        dataset["rewards"].iloc[j] += 0.03
+                    
+                    ## Angle funnel around hitting reward
+                    if angle >= lo_bound_angle and angle <= up_bound_angle:
+                        dataset["rewards"].iloc[j] += 0.4
 
-                        ## Cue acceleration reward
-                        if dataset["actions"][1].iloc[j] >= lo_bound_force and dataset["actions"][1].iloc[j] <= up_bound_force: 
-                            dataset["rewards"].iloc[j] += 0.1
-                    else:
+                    ## Cue acceleration reward
+                    if dataset["actions"][1].iloc[j] >= lo_bound_force and dataset["actions"][1].iloc[j] <= up_bound_force: 
+                        dataset["rewards"].iloc[j] += 0.1
+                    """else:
                         ## Angle funnel around hitting reward
                         if angle >= lo_bound_angle and angle <= up_bound_angle:
-                            dataset["rewards"].iloc[j] += 0.08
+                            dataset["rewards"].iloc[j] += 0.03"""
 
                         ## Cue acceleration reward
                         #if np.sin(angle)*dataset["actions"][1].iloc[j+1] >= lo_bound_force and np.sin(angle)*dataset["actions"][1].iloc[j+1] <= up_bound_force: 
                             #dataset["rewards"].iloc[j] += 0.01
     return dataset
 
-def reset_rewards2(rewards, terminals):
-    N=len(rewards)-1
-    for i in range(N):
-        if i == N-1:        #No last timestep due to new_states, so advance reward for the last trial 
+def reset_rewards2(rewards, terminals, trial):
+    
+    for i in range(len(rewards)):
+        if rewards.iloc[i] == 100.0:
+            rewards.iloc[i] = 1.0
+        else:
+            rewards.iloc[i] = 0.0
+    """terminals_ind = trial[terminals==True]
+    new_rewards = pd.DataFrame(np.zeros(len(rewards)))
+    #N=len(trial.unique()
+
+    for i, t_ind in enumerate(trial.unique()):
+        ind = terminals_ind[terminals_ind == t_ind]
+        if terminals.iloc[ind]:
+            if rewards.iloc[ind] == 100.0:
+                new_rewards.iloc[ind] = 1.0
+            elif rewards.iloc[ind] == -10.0 :
+                new_rewards.iloc[ind] = 0.0
+        else:
+            new_rewards.iloc[ind] = 0.0"""
+        
+        
+    """if i == N-1:        #No last timestep due to new_states, so advance reward for the last trial 
             if terminals.iloc[i]:
                 if rewards.iloc[i+1] == 100.0:
                     rewards.iloc[i] = 1.0
@@ -321,11 +327,12 @@ def reset_rewards2(rewards, terminals):
                 elif rewards.iloc[i] == -10.0 :
                     rewards.iloc[i] = 0.0
             else:
-                rewards.iloc[i] = 0.0
-    rewards =rewards.drop(index=N)
+                rewards.iloc[i] = 0.0"""
+    #new_rewards =new_rewards.drop(index=N)
+    #terminals =terminals.drop(index=N)
     return rewards, terminals
 
-def import_rewards(path1, path2):
+def import_rewards(path2):  #path1, 
         """og_df = pd.read_csv(path1, header = 0, \
                 names = ['rewards','cueballpos', 'cueballvel','redballpos', 'targetcornerpos', 'cueposfront', 'cueposback', 'cuedirection', 'cuevel'], usecols = [1,2,3,4,5,6,7,8,9], lineterminator = "\n")
         og_df = og_df.replace([r'\n', r'\[', r'\]'], '', regex=True) 
@@ -347,9 +354,13 @@ def import_rewards(path1, path2):
                 'rewards': rewards,
                 'terminals': terminals}
         #print(dataset["states"].shape)
-        #rewards, terminals = reset_rewards2(rewards.squeeze(), terminals)
+        #rewards, terminals = reset_rewards2(rewards.squeeze(), terminals, trial)
+        #dataset["terminals"] = terminals
         #dataset["rewards"] = rewards
         dataset = define_rewards(dataset)
+        
+       # pd_df_ter = pd.DataFrame.from_dict(dataset["terminals"])
+        #df['terminals'] = pd_df_ter
         pd_df_rew = pd.DataFrame.from_dict(dataset["rewards"])
         df['rewards'] = pd_df_rew
                     
@@ -358,15 +369,14 @@ def import_rewards(path1, path2):
 
 def add_rewards(dataset, funnel_Subj, targetball_Subj):
     terminals_ind = dataset["trial"][dataset["terminals"]==True]
-    print(len(dataset["trial"].unique()), len(funnel_Subj), len(targetball_Subj))
     for i, t_ind in enumerate(dataset["trial"].unique()):
         ind = terminals_ind[terminals_ind == t_ind]
         #if funnel_Subj.iloc[i].values:  #dataset["rewards"].iloc[ind].values != 1.0 and 
             #dataset["rewards"].iloc[ind.index.values] += 1.0
         if i>= len(targetball_Subj):
             print(len(targetball_Subj), i, t_ind)
-        if targetball_Subj.iloc[i].values:
-            dataset["rewards"].iloc[ind.index.values] += 0.3
+        #if targetball_Subj.iloc[i].values:
+        dataset["rewards"].iloc[ind.index.values] += targetball_Subj.iloc[i].values
     return dataset
 
 def modify_rewards(path_Subj, funnel_Subj_path, targetball_Subj_path):
@@ -400,52 +410,58 @@ def modify_rewards(path_Subj, funnel_Subj_path, targetball_Subj_path):
 
 if __name__ == "__main__":
     
-    """path1 = "D/Round1/"
-    path2 = "D/Round2/"
-    pathlist = [path1,path2]
+    path1 = "D/Round1/"
+    path2 = "D/Round2/" 
+    pathlist = [path1, path2]
     reward_path = "D/Rewards/"
-    data_path = "data_2_delta/"
-    save_data = "data_2_delta_target/"
+    data_path = "data_original/"
+    save_data = "data_shaped/"
     #for path in pathlist:
-    for i, initial in enumerate(sorted(os.listdir(path1))):
-        if initial == "DR":
-            funnel_Subj_path = reward_path  + str(initial) + "_funnel_rewards.csv"
-            targetball_Subj_path = reward_path  + str(initial) + "_targetball_rewards.csv"
+    
+    list_pathdir = sorted(os.listdir(data_path))
+    for path in pathlist:
+        for i, initial in enumerate(sorted(os.listdir(path))):
+            pathSubj = path + str(initial)
+            for fil in range(len(sorted(os.listdir(pathSubj + '/Game/')))):
+                if sorted(os.listdir(pathSubj + '/Game/'))[fil].find("Block2") > -1:
+                    blockFile = sorted(os.listdir(pathSubj + '/Game/'))[fil]
 
-            path_Subj = data_path + str(initial) + "_Offline_reduced.csv"
+                    if blockFile.find('Reward') > -1:
+                        if blockFile.find('Left') > -1:
+                            funnel_Subj_path = reward_path  + str(initial) + "_funnel_rewards.csv"
+                            targetball_Subj_path = reward_path  + str(initial) + "_targetball_rewards.csv"
 
-            df = modify_rewards(path_Subj, funnel_Subj_path, targetball_Subj_path)
-            
-            path2_save = save_data + str(initial) + "_Offline_reduced.csv"
-            df.to_csv(path2_save)
-            print("modify rewards file ", path2_save, "saved")"""
+                            path_Subj = data_path + str(initial) + "_Offline_3t_data.csv"  #reduced
 
+                            df = modify_rewards(path_Subj, funnel_Subj_path, targetball_Subj_path)
+                            
+                            path2_save = save_data + str(initial) + "_Offline_reduced.csv"#reduced
+                            df.to_csv(path2_save)
+                            print("modify rewards file ", data_path,initial, "saved in ", save_data)
 
+    """
     reduced_data = sorted(os.listdir("reduced_data/"))
-    for i, path2 in enumerate(sorted(os.listdir("data_2_delta_target/"))):
-        path1 = "reduced_data/"+reduced_data[i]
-        path2_ = "data_2_delta_target/"+path2
-        df = import_rewards(path1, path2_)
-        path2_save = "data_2/"+path2
+    data_path = "data_delta_original/"
+    save_data = "data_delta_shaped/"
+    
+    path = "D/Round1/" 
+    list_pathdir = sorted(os.listdir(data_path))
+    for i, initial in enumerate(sorted(os.listdir(path))):
+        #if initial == "SF" or initial == "TA" or initial == "TH" or initial == "TS" or initial == "VB" or initial == "WZ" or initial == "YC" or initial == "YH":
+        path1 = "data/"+reduced_data[i]
+        path2_ = data_path+list_pathdir[i]
+        df = import_rewards(path2_) #path1, 
+        path2_save = save_data+list_pathdir[i]
         df.to_csv(path2_save)
-        print("modify rewards file ", path2_save, "saved")
+        print("modify rewards file ", path2_save, "saved in ", save_data) """
     
     
     
-    """path = "D/Round1/"  #"/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 1/"
+    '''path = "D/Round1/"  #"/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 1/"
     path2 = "D/Round2/"  #"/mnt/c/Users/dario/Documents/DARIO/ETUDES/ICL/code/data/Round 2/"
     pathlist = [path, path2]
-    ## WARNING check which type of feedback in which round, and which corner for each subject
-    #corner =  "left"
-    #data = resultsSingleSubject(initial, "reward", path, corner)
-    '''dic for one subject composed of ~1000 timepoints for one shot, 25 shots in one block, and 10 blocks
-    First 3 blocks are baseline learning, then 6 blocks of adaptation to perturbation, and one final washout block
-    That is 250 shots per subjects, 300'564 points in the dictionnary'''
 
-    # Environment State Properties				
-    #for path in pathlist:
     for i, initial in enumerate(sorted(os.listdir(path))):
-        #if initial != "VB" and initial != "WZ" and initial != "YC":
         pathSubj = path + str(initial)
         for fil in range(len(sorted(os.listdir(pathSubj + '/Game/')))):
             if sorted(os.listdir(pathSubj + '/Game/'))[fil].find("Block2") > -1:
@@ -454,4 +470,4 @@ if __name__ == "__main__":
                 if blockFile.find('Reward') > -1:
                     #data = resultsMultipleSubjects(path, initial, 'reward', 'all')
                     #save_raw_data(data, initial)
-                    #save_RL_reduced_dataset(initial)"""
+        save_RL_reduced_dataset(initial)'''

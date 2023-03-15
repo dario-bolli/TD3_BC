@@ -13,6 +13,7 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.utils.data import DataLoader
 from torch.distributions.kl import kl_divergence
 from torch.nn.utils import clip_grad_norm_
+from sklearn.mixture import GaussianMixture
 import copy
 import math
 from tqdm import tqdm
@@ -23,53 +24,59 @@ import wandb
 from sklearn.metrics import mean_squared_error
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 ##################################################### Functions ############################################################
 def update_cueballpos(prev_pos, velocity):
     dt = 0.0111
     new_pos = prev_pos + velocity*dt
     return new_pos
 
-def update_cuepos(prev_pos_front, actions, call="plot"): #, vel
+def update_cuepos(prev_pos_front, actions, prev_angle, prev_force, call="plot"): #, vel
     dt = 0.0111
     len_cue_stick = 1.21	#fixed value approximate over all subjects and trials, but not important to be precise, just for visualisation
     
-    magnitude = actions[1]  #*(3 + 3) - 3
-    angle = actions[0]  #*(135 - 45)+45
-    new_vel = np.array([magnitude*np.cos(np.radians(angle)),0,magnitude*np.sin(np.radians(angle))])      #Warning not the best to set y vel to 0 should find another way
+    new_force = actions[1]  #prev_force+
+    new_angle = actions[0]  #prev_angle+
+    new_vel = np.array([new_force*np.cos(np.radians(new_angle)),0,new_force*np.sin(np.radians(new_angle))])      #Warning not the best to set y vel to 0 should find another way
     #print("action angle: ", angle) 
-    angle_complementary = 180-angle
+    angle_complementary = 180-new_angle
     new_pos_front = prev_pos_front + new_vel * dt
     new_pos_back = np.array([new_pos_front[0] + len_cue_stick*np.cos(np.radians(-angle_complementary)),0, new_pos_front[2] + len_cue_stick*np.sin(np.radians(-angle_complementary))])   #0 on y 
 
     new_cue_dir = (new_pos_front - new_pos_back)/np.linalg.norm((new_pos_front - new_pos_back))
     #print("new cue dir: ", new_cue_dir)
-    return new_pos_front, new_pos_back, new_cue_dir
+    return new_pos_front, new_pos_back, new_cue_dir, new_angle, new_force
     """if call=="evaluation":
         return torch.tensor(new_pos_front, device=device), torch.tensor(new_pos_back, device=device), torch.tensor(new_cue_dir, device=device)			#, new_vel
     else:
         return new_pos_front, new_pos_back, new_cue_dir"""
 
-def compute_reward_evaluation(angle, force, target_corner, reward, mean_actions, std_actions):	#cuevel
-    angle = angle*std_actions[0] + mean_actions[0]
-    force = force*std_actions[1] + mean_actions[1]
+def compute_reward_evaluation(prev_angle, angle, next_angle, force, target_corner, reward, mean_actions, std_actions):	#cuevel
+    #angle = angle*std_actions[0] + mean_actions[0]
+    #force = force*std_actions[1] + mean_actions[1]
     #print("pred angle: ", angle)
     if target_corner == "right":
         angle = 180 - angle
+        prev_angle = 180 - prev_angle
     mean_pocket = 104.94109114059208 #105.0736 
     lbPocket = mean_pocket - 0.9208495903864685	#0.3106383 #= 104.7629617
     ubPocket = mean_pocket + 0.9208495903864685	#0.2543617 #= 105.3279617
+    lbPocket_extended = mean_pocket - 0.9208495903864685	#0.3106383 #= 104.7629617
+    ubPocket_extended = mean_pocket + 0.9208495903864685	#0.2543617 #= 105.3279617
 
     if reward != 1.0:
-        if angle <= ubPocket and angle >= lbPocket:     #Mathf.Max(currentTargetAngle, 
-            if force > 0.6:
-                reward = 1.0
-                #print("Funnel")
+        if force > 0.1:
+            if angle <= ubPocket and angle >= lbPocket:     #Mathf.Max(currentTargetAngle, 
+                #if prev_angle <= ubPocket_extended and prev_angle >= lbPocket_extended:
+                    #if next_angle <= ubPocket_extended and next_angle >= lbPocket_extended:
+            	reward = 1.0
+                    #print("Funnel")
     return reward
 
 def loss_2_behaviour(angle, cuedir, mean_states, std_states, mean_actions, std_actions):
 	cuedir = cuedir*std_states[18:21] + mean_states[18:21]
 	label_angle = np.rad2deg(np.arctan2(cuedir[2], cuedir[0]))
-	angle = angle*std_actions[0]+mean_actions[0]
+	angle = angle	#*std_actions[0]+mean_actions[0]
 	return (angle - label_angle)**2	#F.mse_loss(angle, label_angle)
 
 def weighted_sample(dic,prob_dist):
@@ -108,6 +115,21 @@ def get_trajectory(dic, ind):
     return (torch.FloatTensor(dic['states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['actions'][dic['trial'] == ind].to_numpy()).to(device), 
             torch.FloatTensor(dic['new_states'][dic['trial'] == ind].to_numpy()).to(device), torch.FloatTensor(dic['rewards'][dic['trial'] == ind].to_numpy()).to(device), 
             torch.from_numpy(dic['terminals'][dic['trial'] == ind].to_numpy(dtype=bool)).to(device))
+
+def bimodal_normalization(data):	#for corner left and right
+
+	# Fit a mixture of two Gaussians to the data
+	gmm = GaussianMixture(n_components=2)
+	gmm.fit(data.reshape(-1, 1))
+
+	# Compute the means and standard deviations of the Gaussian components
+	means = gmm.means_.flatten()
+	stds = np.sqrt(gmm.covariances_.flatten())
+
+	# Normalize the data using the mixture of Gaussians
+	normalized_data = (data - means[0]) / stds[0] * (stds[1] / stds[0]) + means[1]
+
+	return normalized_data, mean, std
 
 def normalize_features(dataset, eps = 1e-3):
 	
@@ -217,67 +239,88 @@ def load_clean_data(filename):
 	mean_states, std_states, mean_actions, std_actions = normalize_features(train_set)
 	normalize_test_features(test_set, mean_states, std_states, mean_actions, std_actions)
 	print("Train set number of trajectories: ", train_set['trial'].unique().shape[0], "Test set number of trajectories: ",test_set['trial'].unique().shape[0])
-	return train_set, test_set, mean_states, std_states, mean_actions, std_actions
+	return train_set, test_set	, mean_states, std_states, mean_actions, std_actions
 
 ################################################## TD3 Agent ##################################################################
+def hidden_init(layer):
+    fan_in = layer.weight.data.size()[0]
+    lim = 1. / np.sqrt(fan_in)
+    return (-lim, lim)
 
 class Actor(nn.Module):
-	def __init__(self, state_dim, action_dim, max_action):
+	def __init__(self, state_dim, action_dim, hidden_dim, hidden_dim2, max_action):
 		super(Actor, self).__init__()
-		self.l1 = nn.Linear(state_dim, 256)
-		self.l2 = nn.Linear(256, 512)
-		self.l3 = nn.Linear(512, 256)
-		self.l4 = nn.Linear(256, action_dim)
-		self.dropout = nn.Dropout(0.25)
-		#self.actions_upper_bound = torch.tensor([1,1,1,1,1,1,1,1,0.2,1])#,1,1])    #135
-		#self.actions_lower_bound = torch.tensor([0,0,0,0,0,0,-1,-1,-0.2,-1])#,-1,-1])  #45
+		self.l1 = nn.Linear(state_dim, hidden_dim)
+		self.l2 = nn.Linear(hidden_dim,hidden_dim2)    # 512)
+		self.l3 = nn.Linear(hidden_dim2,hidden_dim)
+		self.l4 = nn.Linear(hidden_dim, action_dim)
+		#self.dropout = nn.Dropout(0.25)
+		self.actions_upper_bound = torch.tensor([max_action, max_action]).to(device)	#([1,1])    #135
+		self.actions_lower_bound = torch.tensor([-max_action,-max_action]).to(device)	#([-1,-1])  #45
 		self.max_action = max_action
-		
+		self.reset_parameters()
+
+	def reset_parameters(self):
+		self.l1.weight.data.uniform_(*hidden_init(self.l1))
+		self.l2.weight.data.uniform_(*hidden_init(self.l2))
+		self.l3.weight.data.uniform_(*hidden_init(self.l3))
+		self.l4.weight.data.uniform_(*hidden_init(self.l4))
 
 	def forward(self, state):
 		a = F.relu(self.l1(state))
-		a = self.dropout(a)
+		#a = self.dropout(a)
 		a = F.relu(self.l2(a))
-		a = self.dropout(a)
+		#a = self.dropout(a)
 		a = F.relu(self.l3(a))
-		a = self.dropout(a)
+		#a = self.dropout(a)
 		a = torch.tanh(self.l4(a))
-		#rescaled_actions = self.actions_lower_bound + (self.actions_upper_bound - self.actions_lower_bound) * (a + 1) / 2
-		return 	a	#rescaled_actions #torch.tanh(self.l4(a))
+		rescaled_actions = self.actions_lower_bound + (self.actions_upper_bound - self.actions_lower_bound) * (a + 1) / 2
+		return rescaled_actions #torch.tanh(self.l4(a))
 
 class Critic(nn.Module):
-	def __init__(self, state_dim, action_dim):
+	def __init__(self, state_dim, action_dim, hidden_dim, hidden_dim2):
 		super(Critic, self).__init__()
 		# Q1 architecture
-		self.l1 = nn.Linear(state_dim + action_dim, 256)
-		self.l2 = nn.Linear(256, 512)
-		self.l3 = nn.Linear(512, 256)
-		self.l4 = nn.Linear(256, 1)
-		self.dropout = nn.Dropout(0.25)
+		self.l1 = nn.Linear(state_dim + action_dim, hidden_dim)
+		self.l2 = nn.Linear(hidden_dim,hidden_dim2)   #512)
+		self.l3 = nn.Linear(hidden_dim2,hidden_dim)
+		self.l4 = nn.Linear(hidden_dim, 1)
+		#self.dropout = nn.Dropout(0.25)
 
 		# Q2 architecture
-		self.l5 = nn.Linear(state_dim + action_dim, 256)
-		self.l6 = nn.Linear(256,512)
-		self.l7 = nn.Linear(512, 256)
-		self.l8 = nn.Linear(256, 1)
+		self.l5 = nn.Linear(state_dim + action_dim, hidden_dim)
+		self.l6 = nn.Linear(hidden_dim,hidden_dim2)    #512)
+		self.l7 = nn.Linear(hidden_dim2,hidden_dim)
+		self.l8 = nn.Linear(hidden_dim, 1)
+		self.reset_parameters()
 
+	def reset_parameters(self):
+		self.l1.weight.data.uniform_(*hidden_init(self.l1))
+		self.l2.weight.data.uniform_(*hidden_init(self.l2))
+		self.l3.weight.data.uniform_(*hidden_init(self.l3))
+		self.l4.weight.data.uniform_(*hidden_init(self.l4))
+
+		self.l5.weight.data.uniform_(*hidden_init(self.l5))
+		self.l6.weight.data.uniform_(*hidden_init(self.l6))
+		self.l7.weight.data.uniform_(*hidden_init(self.l7))
+		self.l8.weight.data.uniform_(*hidden_init(self.l8))
 
 	def forward(self, state, action):
 		sa = torch.cat([state, action], 1)
 		q1 = F.relu(self.l1(sa))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
 		q1 = F.relu(self.l2(q1))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
 		q1 = F.relu(self.l3(q1))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
 		q1 = self.l4(q1)
 
 		q2 = F.relu(self.l5(sa))
-		q2 = self.dropout(q2)
+		#q2 = self.dropout(q2)
 		q2 = F.relu(self.l6(q2))
-		q2 = self.dropout(q2)
+		#q2 = self.dropout(q2)
 		q2 = F.relu(self.l7(q2))
-		q2 = self.dropout(q2)
+		#q2 = self.dropout(q2)
 		q2 = self.l8(q2)
 		return q1, q2
 
@@ -286,11 +329,11 @@ class Critic(nn.Module):
 		sa = torch.cat([state, action], 1)
 
 		q1 = F.relu(self.l1(sa))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
 		q1 = F.relu(self.l2(q1))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
 		q1 = F.relu(self.l3(q1))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
 		q1 = self.l4(q1)
 		return q1
 
@@ -302,22 +345,24 @@ class TD3_BC(nn.Module):
 		action_dim,
 		max_action,
 		discount=0.99,
-		tau=0.005,
+		tau=0.0005,
 		policy_noise=0.2,
 		noise_clip=0.5,
 		policy_freq=2,
 		alpha=2.5,
 		):
 		super(TD3_BC, self).__init__()
-		self.actor = Actor(state_dim, action_dim, max_action).to(device)
+		hidden_dim = 32
+		hidden_dim2 = 64
+		self.actor = Actor(state_dim, action_dim, hidden_dim, hidden_dim2, max_action).to(device)
 		self.actor_target = copy.deepcopy(self.actor)
 		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-5)
-		#self.actor_scheduler = torch.optim.lr_scheduler.StepLR(self.actor_optimizer, step_size=10000, gamma=1e-5)
+		self.actor_scheduler = torch.optim.lr_scheduler.StepLR(self.actor_optimizer, step_size=150000, gamma=0.1)
 
-		self.critic = Critic(state_dim, action_dim).to(device)
+		self.critic = Critic(state_dim, action_dim, hidden_dim, hidden_dim2).to(device)
 		self.critic_target = copy.deepcopy(self.critic)
-		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)	
-		#self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=10000, gamma=1e-5)
+		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-5)	
+		self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=150000, gamma=0.1)
 
 		self.max_action = max_action
 		self.discount = discount
@@ -360,8 +405,6 @@ class TD3_BC(nn.Module):
 		current_Q1, current_Q2 = self.critic(states, actions)	#.reshape(-1,1))#Warning when action shape is 1
 		# Compute critic loss
 		critic_loss = F.mse_loss(current_Q1.squeeze(), target_Q) + F.mse_loss(current_Q2.squeeze(), target_Q)
-		if critic_loss == 0.0:
-			print("critic_loss: ", F.mse_loss(current_Q1.squeeze(), target_Q), F.mse_loss(current_Q2.squeeze(), target_Q))
 		# Optimize the critic
 		self.critic_optimizer.zero_grad()
 		critic_loss.backward()
@@ -555,12 +598,7 @@ class AC_Off_POC_TD3(object):
 
 ################################################## CQL Agent ###############################################################
 
-def hidden_init(layer):
-    fan_in = layer.weight.data.size()[0]
-    lim = 1. / np.sqrt(fan_in)
-    return (-lim, lim)
-
-class LayerNorm(nn.Module):
+'''class LayerNorm(nn.Module):
     """
     Simple 1D LayerNorm.
     """
@@ -587,7 +625,7 @@ class LayerNorm(nn.Module):
             output = output * self.scale_param
         if self.center:
             output = output + self.center_param
-        return 
+        return '''
 
 class Actor_CQL(nn.Module):
     """Actor (Policy) Model."""
@@ -607,12 +645,22 @@ class Actor_CQL(nn.Module):
         self.log_std_max = log_std_max
         
         self.fc1 = nn.Linear(state_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size2)
-        self.fc3 = nn.Linear(hidden_size2, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size2)  #, hidden_size2)
+        self.fc3 = nn.Linear(hidden_size2, hidden_size)  #, hidden_size2)
+        #self.fc4 = nn.Linear(hidden_size2, hidden_size)
         self.mu = nn.Linear(hidden_size, action_size)
         self.log_std_linear = nn.Linear(hidden_size, action_size)
-        #self.dropout = nn.Dropout(0.2)
-        
+        #self.dropout = nn.Dropout(0.1)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.fc1.weight.data.uniform_(*hidden_init(self.fc1))
+        self.fc2.weight.data.uniform_(*hidden_init(self.fc2))
+        self.fc3.weight.data.uniform_(*hidden_init(self.fc3))
+        #self.fc4.weight.data.uniform_(*hidden_init(self.fc4))
+        self.mu.weight.data.uniform_(-3e-3, 3e-3)
+        self.log_std_linear.weight.data.uniform_(-3e-3, 3e-3)
+
     def forward(self, state):
         x = F.relu(self.fc1(state))
         #x = self.dropout(x)
@@ -620,6 +668,7 @@ class Actor_CQL(nn.Module):
         #x = self.dropout(x)
         x = F.relu(self.fc3(x))
         #x = self.dropout(x)
+        #x = F.relu(self.fc4(x))
         mu = self.mu(x)
         log_std = self.log_std_linear(x)
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
@@ -669,10 +718,11 @@ class Critic_CQL(nn.Module):
         super(Critic_CQL, self).__init__()
         #self.seed = torch.manual_seed(seed)
         self.fc1 = nn.Linear(state_size+action_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size2)
-        self.fc3 = nn.Linear(hidden_size2, hidden_size)
-        self.fc4 = nn.Linear(hidden_size, 1)
-        #self.dropout = nn.Dropout(0.2)
+        self.fc2 = nn.Linear(hidden_size, hidden_size2)  #, hidden_size2)
+        self.fc3 = nn.Linear(hidden_size2, hidden_size) #, hidden_size2)
+        #self.fc4 = nn.Linear(hidden_size2, hidden_size)
+        self.fc5 = nn.Linear(hidden_size, 1)
+        #self.dropout = nn.Dropout(0.1)
         #self.layer_norm =  torch.nn.LayerNorm(hidden_size) #LayerNorm(hidden_size)
 
         self.reset_parameters()
@@ -681,7 +731,8 @@ class Critic_CQL(nn.Module):
         self.fc1.weight.data.uniform_(*hidden_init(self.fc1))
         self.fc2.weight.data.uniform_(*hidden_init(self.fc2))
         self.fc3.weight.data.uniform_(*hidden_init(self.fc3))
-        self.fc4.weight.data.uniform_(-3e-3, 3e-3)
+        #self.fc4.weight.data.uniform_(*hidden_init(self.fc4))
+        self.fc5.weight.data.uniform_(-3e-3, 3e-3)
 
     def forward(self, state, action):
         """Build a critic (value) network that maps (state, action) pairs -> Q-values."""
@@ -694,7 +745,8 @@ class Critic_CQL(nn.Module):
         #x = self.dropout(x)
         x = F.relu(self.fc3(x))
         #x = self.dropout(x)
-        return self.fc4(x)
+        #x = F.relu(self.fc4(x))
+        return self.fc5(x)
 
 class CQLSAC(nn.Module):
     """Interacts with and learns from the environment."""
@@ -717,36 +769,45 @@ class CQLSAC(nn.Module):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
-        self.use_automatic_entropy_tuning = True
+	
+        self.importance_sampling = True
         self.epoch = 0
+        self.freq_update = 2
         
         self.gamma = 0.99
-        self.tau = 5e-3
-        hidden_size = 256
-        hidden_size2 = 512
-        learning_rate = 3e-5 
-        learning_rate_actor = 3e-5
-        learning_rate_critic = 3e-4
+        self.tau = 0.001
+        hidden_size = 64
+        hidden_size2 =  64	#512
+        learning_rate = 1e-5
+        learning_rate_actor = 1e-5
+        learning_rate_critic = 1e-5
         self.clip_grad_param = 1
 
-        self.target_entropy = -action_size  # -dim(A)
-
-        self.log_alpha = torch.tensor([0.0], requires_grad=True)
-        self.alpha = self.log_alpha.exp().detach()
-        self.alpha_optimizer = optim.Adam(params=[self.log_alpha], lr=learning_rate) 
-        
-        # CQL params
-        self.with_lagrange = True	#False
-        self.temp = 1.0
+        # CQL parameters
         self.cql_weight = 1.0
-        self.target_action_gap = 0.0
-        self.cql_log_alpha = torch.zeros(1, requires_grad=True)
-        self.cql_alpha_optimizer = optim.Adam(params=[self.cql_log_alpha], lr=learning_rate) 
+        self.temp = 1.0
+        self.use_automatic_entropy_tuning = True
+        if self.use_automatic_entropy_tuning:
+            self.target_entropy = -5.0	#action_size  # -dim(A) #-np.prod(self.env.action_space.shape).item() 
+            
+            self.log_alpha = torch.tensor([0.0], requires_grad=True)
+            self.alpha = self.log_alpha.exp().detach()
+            self.alpha_optimizer = optim.Adam(params=[self.log_alpha], lr=learning_rate)
+        else:
+            self.alpha=torch.ones(1)
+	
+        self.with_lagrange = True
+        if self.with_lagrange:
+            self.target_action_gap = 10  #lagrange_thresh
+            self.cql_log_alpha = torch.zeros(1, requires_grad=True)
+            self.cql_alpha_optimizer = optim.Adam(params=[self.cql_log_alpha], lr=learning_rate) 
+
         
         # Actor Network 
 
         self.actor_local = Actor_CQL(state_size, action_size, hidden_size, hidden_size2).to(device)
-        self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=learning_rate_actor)     
+        self.actor_optimizer = optim.Adam(self.actor_local.parameters(), lr=learning_rate_actor)   
+        #self.actor_scheduler = torch.optim.lr_scheduler.StepLR(self.actor_optimizer, step_size=150000, gamma=0.1)  
         
         # Critic Network (w/ Target Network)
 
@@ -762,9 +823,11 @@ class CQLSAC(nn.Module):
         self.critic2_target.load_state_dict(self.critic2.state_dict())
 
         self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=learning_rate_critic)
+        #self.critic1_scheduler = torch.optim.lr_scheduler.StepLR(self.critic1_optimizer, step_size=150000, gamma=0.1)
         self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=learning_rate_critic) 
+        #self.critic2_scheduler = torch.optim.lr_scheduler.StepLR(self.critic2_optimizer, step_size=150000, gamma=0.1)
 
-    
+
     def select_action(self, state, eval=False):
         """Returns actions for given state as per current policy."""
         #state = torch.from_numpy(state).float().to(self.device)
@@ -1000,6 +1063,7 @@ class CQLSAC(nn.Module):
             experiences (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples 
             gamma (float): discount factor
         """
+        self.epoch += 1
         # Sample replay buffer 
         #states, actions, next_states, rewards, not_dones = experiences.sample(512)
         states, actions, next_states, rewards, dones = experiences
@@ -1016,20 +1080,16 @@ class CQLSAC(nn.Module):
         critic2_loss = torch.tensor(0.0, device = device)
         cql1_scaled_loss = torch.tensor(0.0, device = device)
         cql2_scaled_loss = torch.tensor(0.0, device = device)
-
-        # ---------------------------- update actor ---------------------------- #
-        current_alpha = copy.deepcopy(self.alpha)
-        actor_loss, log_pis = self.calc_policy_loss(states, current_alpha)
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
         
+    
         # Compute alpha loss
-        alpha_loss = - (self.log_alpha.exp() * (log_pis.cpu() + self.target_entropy).detach().cpu()).mean()
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
-        self.alpha = self.log_alpha.exp().detach()
+        if self.use_automatic_entropy_tuning:
+            actions_pred, log_pis = self.actor_local.evaluate(states)
+            alpha_loss = - (self.log_alpha.exp() * (log_pis.cpu() + self.target_entropy).detach().cpu()).mean()	
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self.alpha = self.log_alpha.exp().detach()
 
         # ---------------------------- update critic ---------------------------- #
         # Get predicted next-state actions and Q values from target models
@@ -1050,8 +1110,8 @@ class CQLSAC(nn.Module):
         critic2_loss = F.mse_loss(q2.squeeze(), Q_targets)
 
         # CQL addon
-        random_actions = torch.FloatTensor(q1.shape[0] * 10, actions.shape[-1]).uniform_(-1, 1).to(self.device)
-        num_repeat = int (random_actions.shape[0] / states.shape[0])
+        random_actions = torch.FloatTensor(q1.shape[0] * 10, actions.shape[-1]).uniform_(0, 1).to(self.device)	#-1
+        num_repeat = int(random_actions.shape[0] / states.shape[0])
         temp_states = states.unsqueeze(1).repeat(1, num_repeat, 1).view(states.shape[0] * num_repeat, states.shape[1])
         temp_next_states = next_states.unsqueeze(1).repeat(1, num_repeat, 1).view(next_states.shape[0] * num_repeat, next_states.shape[1])
         
@@ -1073,7 +1133,15 @@ class CQLSAC(nn.Module):
         assert cat_q1.shape == (states.shape[0], 3 * num_repeat, 1), f"cat_q1 instead has shape: {cat_q1.shape}"
         assert cat_q2.shape == (states.shape[0], 3 * num_repeat, 1), f"cat_q2 instead has shape: {cat_q2.shape}"
         
-
+        """if self.importance_sampling == True:
+            # importance sammpled version
+            random_density = np.log(0.5 ** .shape[-1])
+            cat_q1 = torch.cat(
+                [random_values1 - random_density, next_pi_values1 - new_log_pis.detach(), current_pi_values1 - curr_log_pis.detach()], 1
+            )
+            cat_q2 = torch.cat(
+                [random_values2 - random_density, next_pi_values2 - new_log_pis.detach(), current_pi_values1 - curr_log_pis.detach()], 1
+            )"""
         cql1_scaled_loss = ((torch.logsumexp(cat_q1 / self.temp, dim=1).mean() * self.cql_weight * self.temp) - q1.mean()) * self.cql_weight
         cql2_scaled_loss = ((torch.logsumexp(cat_q2 / self.temp, dim=1).mean() * self.cql_weight * self.temp) - q2.mean()) * self.cql_weight
         
@@ -1092,23 +1160,34 @@ class CQLSAC(nn.Module):
         total_c1_loss = critic1_loss + cql1_scaled_loss
         total_c2_loss = critic2_loss + cql2_scaled_loss
         
-        
+       
         # Update critics
         # critic 1
         self.critic1_optimizer.zero_grad()
         total_c1_loss.backward(retain_graph=True)
         clip_grad_norm_(self.critic1.parameters(), self.clip_grad_param)
         self.critic1_optimizer.step()
+        
+        #if self.epoch%100==0 or self.epoch>310:
+            #print("critic weights: ", self.critic1.fc2.weight, self.critic1.fc4.weight)
         # critic 2
         self.critic2_optimizer.zero_grad()
         total_c2_loss.backward()
         clip_grad_norm_(self.critic2.parameters(), self.clip_grad_param)
         self.critic2_optimizer.step()
-
+        
+        # ---------------------------- update actor ---------------------------- #
+        # Delayed policy updates, update actor networks every update period
+        #if self.epoch % self.freq_update == 0:
+        current_alpha = copy.deepcopy(self.alpha)
+        actor_loss, log_pis = self.calc_policy_loss(states, current_alpha)
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
         # ----------------------- update target networks ----------------------- #
         self.soft_update(self.critic1, self.critic1_target)
         self.soft_update(self.critic2, self.critic2_target)
-        
+    
         ## store losses ##
         """alpha_losses_.append(alpha_loss.item())
         critic1_losses_.append(critic1_loss.item())
@@ -1118,7 +1197,10 @@ class CQLSAC(nn.Module):
         actor_losses_.append(actor_loss.item())"""
         #return actor_losses_, alpha_losses_, critic1_losses_, critic2_losses_,cql1_scaled_losses_, cql2_scaled_losses_
         #return actor_loss.item(), alpha_loss.item(), critic1_loss.item(), critic2_loss.item(), cql1_scaled_loss.item(), cql2_scaled_loss.item()	#, current_alpha, cql_alpha_loss.item(), cql_alpha.item()
-        return actor_loss.cpu().detach(), alpha_loss.cpu().detach(), critic1_loss.cpu().detach(), critic2_loss.cpu().detach(),cql1_scaled_loss.cpu().detach(), cql2_scaled_loss.cpu().detach()
+        #self.actor_scheduler.step()
+        #self.critic1_scheduler.step()
+        #self.critic2_scheduler.step()
+        return actor_loss.cpu().detach(), alpha_loss.cpu().detach(), critic1_loss.cpu().detach(), critic2_loss.cpu().detach(),cql1_scaled_loss.cpu().detach(), cql2_scaled_loss.cpu().detach(), total_c1_loss.cpu().detach(), total_c2_loss.cpu().detach(), self.log_alpha.exp().cpu().detach(), log_pis.cpu().detach()
 
     def soft_update(self, local_model , target_model):
         """Soft update model parameters.
@@ -1154,7 +1236,7 @@ class CQLSAC(nn.Module):
         self.actor_target = copy.deepcopy(self.actor_local)
 
 ######################### Train ####################################
-def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, train=True, agent = "TD3_BC", data_folder = ""):  
+def train(filename, state_dim=21, action_dim=2, epochs=3000, batch_size = 256, train=True, agent = "TD3_BC", data_folder = ""):  
 	print("Load dataset")
 	train_set, test_set, mean_states, std_states, mean_actions, std_actions = load_clean_data(filename)
 	
@@ -1165,7 +1247,7 @@ def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, t
     # Agent parameters
 	args = {
         # Experiment
-        "policy": "TD3_BC",
+        "policy": agent,
 		"data": data_folder,
         "seed": 0, 
         "eval_freq": 5e3,
@@ -1173,23 +1255,23 @@ def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, t
         "save_model": "store_true",
         "load_model": "",                 # Model load file name, "" doesn't load, "default" uses file_name
         # TD3
-        "expl_noise": 0.1,
+        "expl_noise": 0.2,
         "batch_size": 256,
         "discount": 0.99,
-        "tau": 0.002,
-        "policy_noise": 0.2,
+        "tau": 0.001,
+        "policy_noise": 0.02,
         "noise_clip": 0.5,
         "policy_freq": 2,
         # TD3 + BC
-        "alpha": 2.5,
+        "alpha": 4,	#2.5,
         "normalize": True,
-        "state_dim": 14,
-        "action_dim": 3,
+        "state_dim": 21,
+        "action_dim": 2,
         "max_action": 1,	#different max_action for each dimension of the Action space?
         "discount": 0.99,
-        "tau": 0.002,
-		"learning_rate_actor": 3e-5, 
-		"learning_rate_critic": 3e-4,
+        "tau": 0.001,
+		"learning_rate_actor": 1e-5, 
+		"learning_rate_critic": 1e-5,
         }
 
 	kwargs = {
@@ -1207,27 +1289,27 @@ def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, t
 	    }
 
 
-	### Logs wandb	###
-
-	wandb.init(project="reward-learning", config=args)
-
-	#wandb.define_metric("epoch")
-	# define which metrics will be plotted against it
-	wandb.define_metric("actor_loss")	#, step_metric="epoch")
-	#wandb.define_metric("critic_loss", step_metric="epoch")
-	#wandb.save(args)
-
 	if agent == "CQL_SAC":
 		# Initialize Agent
 		policy = CQLSAC(state_dim,action_dim)
-		
-		# Magic
-		wandb.watch(policy, log_freq=500)
 
 		print("---------------------------------------")
 		print(f"Policy: {agent}")
 		print("---------------------------------------")
 		if train == True:
+
+
+			### Logs wandb	###
+
+			wandb.init(project="reward-learning", name="5t_64-64_alpha-target5-lagrange10", config=args)
+			# Magic
+			wandb.watch(policy, log_freq=500)
+			#wandb.define_metric("epoch")
+			# define which metrics will be plotted against it
+			#wandb.define_metric("actor_loss")	#, step_metric="epoch")
+			#wandb.define_metric("critic_loss", step_metric="epoch")
+			#wandb.save(args)
+
 			alpha_losses = []
 			critic1_losses = []
 			critic2_losses = []
@@ -1238,34 +1320,73 @@ def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, t
 			
 			for i in tqdm(range(1, epochs)):
 				experience = weighted_sample_experience(train_set, sample_size=batch_size)   #trajectory = weighted_sample(train_set, prob_dist)    #sample(train_set) 
-				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(experience, batch_size = batch_size)	#trajectory
+				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss, total_c1_loss, total_c2_loss, alpha, log_pi= policy.train(experience, batch_size = batch_size)	#trajectory
 				alpha_losses.append(alpha_loss.numpy())
 				critic1_losses.append(critic1_loss.numpy()) # + cql1_scaled_loss)
 				critic2_losses.append(critic2_loss.numpy()) # + cql2_scaled_loss)
 				actor_losses.append(actor_loss.numpy())
 				cql1_scaled_losses.append( cql1_scaled_loss.numpy())
 				cql2_scaled_losses.append(cql2_scaled_loss.numpy())
-				
+				#total_c1_losses.append(total_c1_loss.numpy())
+				#total_c2_losses.append(total_c2_loss.numpy())
 				wandb.log({"actor loss": actor_loss, 
 						"critic 1 loss": critic1_loss,
 						"critic 2 loss": critic2_loss, 
 						"alpha loss": alpha_loss,
 						"cql 1 loss": cql1_scaled_loss,
-						"cql 2 loss": cql2_scaled_loss
+						"cql 2 loss": cql2_scaled_loss,
+						"total c1 loss": total_c1_loss,
+						"total c2 loss": total_c2_loss,
+						"alpha": alpha,
+						"log_pi": log_pi
 						})
 
 				if (i%5000 == 0 and i<10000) or i%50000 == 0:
-					plot_action_animated_learnt_policy(train_set, policy, mean_states, std_states, mean_actions, std_actions, "CQL_SAC",  i, data_folder)
-					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, mean_states, std_states, mean_actions, std_actions, "CQL_SAC",i , action_dim, data_folder)
-					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
+					#plot_action_animated_learnt_policy(train_set, policy, mean_states, std_states, mean_actions, std_actions, "CQL_SAC",  i, data_folder)
+					#evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, mean_states, std_states, mean_actions, std_actions, "CQL_SAC",i , action_dim, data_folder)
+					#evaluation_losses = np.append(evaluation_losses, evaluation_loss.cpu().detach().numpy())
 					policy.save('models/CQL_SAC'+data_folder+'/CQL_SAC_policy')
 
-				if (i%1000 == 0 and i<10000) or i%5000 == 0:
-					avg_reward, avg_reward_human, avg_loss_2_behaviour = evaluate_agent_performance(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent)
+				if (i%10 == 0 and i<500) or (i%50 == 0 and i<2000) or (i%200 == 0 and i<10000) or i%2000 == 0:
+					ind = test_set['trial'].unique()[42]
+					states, actions, new_states, reward_, terminals= get_trajectory(test_set, ind)
+					target_corner = (states[3,9:12].cpu().detach().numpy()*std_states[9:12] + mean_states[9:12])		
+					target_corner_angle = np.rad2deg(np.arctan2(target_corner[2], target_corner[0]))
+					
+					#angle = np.rad2deg(np.arctan2(states[0,20].cpu().detach().numpy()*std_states[20] + mean_states[20], states[0,18].cpu().detach().numpy()*std_states[18] + mean_states[18]))
+
+					#if target_corner_angle < 90.0:
+						#corner="right"
+					#else:
+						#corner="left"
+					#print("corner: ", corner, " behaviour angle: ", angle)
+					#print("max and min angel pred: ",  mean_actions[0], std_actions[0],  1*std_actions[0] +mean_actions[0], -1*std_actions[0] +mean_actions[0])
+
+					action, log_prob = policy.actor_local.evaluate(states)	#get_det_action
+					action = action.cpu().detach().numpy()*std_actions + mean_actions
+					actions = actions.cpu().detach().numpy()*std_actions + mean_actions
+					#print("angle:", angle, action, actions)
+					angle_3 = action[3,0]	#angle+action[0,0]+action[1,0]+action[2,0]
+
+					#dt = 0.0111
+					#cuevel = (states[1][12:15].cpu().detach().numpy()*std_states[12:15] + mean_states[12:15]-states[0][12:15].cpu().detach().numpy()*std_states[12:15] + mean_states[12:15])/dt
+					#force = np.linalg.norm(cuevel) 
+					force_3 = action[3,1]	#force+action[1,1]+action[2,1]
+					
+					angle_ref = actions[3,0] 	#angle+actions[0,0]+actions[1,0]+actions[2,0]
+					force_ref = actions[3,1] 	#force+actions[1,1]+actions[2,1]
+					
+					avg_reward, avg_reward_human, avg_rewards_h, avg_loss_2_behaviour = evaluate_agent_performance(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent)
 					log_dict2 = {
 					"AVG reward Agent": avg_reward,
+					"AVG reward Human control": avg_rewards_h,
 					"AVG reward Human": avg_reward_human,
-					"AVG loss Agent-Human": avg_loss_2_behaviour
+					"AVG loss Agent-Human": avg_loss_2_behaviour,
+					"Angle": angle_3,	#action[:,0].mean(),
+					"Force":force_3,
+					"Angle_ref": angle_ref,
+					"Force_ref": force_ref
+					#"log_prob": log_prob[:,0].mean()
 					}
 					wandb.log(log_dict2)
 
@@ -1301,18 +1422,33 @@ def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, t
 		else:
 			print("load trained model")
 			policy.load('models/CQL_SAC'+data_folder+'/CQL_SAC_policy')
+			ind = test_set['trial'].unique()[42]
+			plot_action_animated_learnt_policy(train_set, policy, mean_states, std_states, mean_actions, std_actions, "CQL_SAC",  ind, data_folder)
+			evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, mean_states, std_states, mean_actions, std_actions, "CQL_SAC",ind , action_dim, data_folder)
+			print("Evaluation loss: ", evaluation_loss)		
+			avg_reward, avg_reward_human, avg_rewards_h,avg_loss_2_behaviour = evaluate_agent_performance(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent)
+			print("AVG reward Agent", avg_reward, "AVG reward Human", avg_reward_human, "AVG loss Agent-Human", avg_loss_2_behaviour)
 
 	elif agent == "TD3_BC":
 		# Initialize Agent
 		policy = TD3_BC(**kwargs) 
-		
-		# Magic
-		wandb.watch(policy, log_freq=500)
-
 		print("---------------------------------------")
 		print(f"Policy: {agent}")	#, Seed: {args['seed']}")
 		print("---------------------------------------")
 		if train == True:
+
+
+			### Logs wandb	###
+
+			wandb.init(project="reward-learning",name="TD3-5t_woBC", config=args)
+			# Magic
+			wandb.watch(policy, log_freq=500)
+			#wandb.define_metric("epoch")
+			# define which metrics will be plotted against it
+			#wandb.define_metric("actor_loss")	#, step_metric="epoch")
+			#wandb.define_metric("critic_loss", step_metric="epoch")
+			#wandb.save(args)
+
 			a_losses = []
 			c_losses = []
 			evaluation_losses = []
@@ -1333,16 +1469,35 @@ def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, t
 
 					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent,i, action_dim, data_folder)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
-					policy.save('models/TD3_BC'+data_folder+'/TD3_BC_policy')
+					#policy.save('models/TD3_BC'+data_folder+'/TD3_BC_policy')
 
-				if (i%1000 == 0 and i<10000) or i%5000 == 0:
-					avg_reward, avg_reward_human, avg_loss_2_behaviour = evaluate_agent_performance(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent)
+				if (i%10 == 0 and i<500) or (i%50 == 0 and i<2000) or (i%200 == 0 and i<10000) or i%2000 == 0:
+					ind = test_set['trial'].unique()[42]
+					states, actions, new_states, reward_, terminals= get_trajectory(test_set, ind)
+					target_corner = (states[3,9:12].cpu().detach().numpy()*std_states[9:12] + mean_states[9:12])	
+
+					action= policy.select_action(states)	#get_det_action
+					action = action.cpu().detach().numpy()*std_actions + mean_actions
+					actions = actions.cpu().detach().numpy()*std_actions + mean_actions
+					#print("angle:", angle, action, actions)
+					angle_3 = action[3,0]	
+					force_3 = action[3,1]	#force+action[1,1]+action[2,1]
+					
+					angle_ref = actions[3,0] 	#angle+actions[0,0]+actions[1,0]+actions[2,0]
+					force_ref = actions[3,1] 	#force+actions[1,1]+actions[2,1]
+					
+					avg_reward, avg_reward_human, avg_rewards_h, avg_loss_2_behaviour = evaluate_agent_performance(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent)
 					log_dict2 = {
 					"AVG reward Agent": avg_reward,
+					"AVG reward Human control":avg_rewards_h,
 					"AVG reward Human": avg_reward_human,
-					"AVG loss Agent-Human": avg_loss_2_behaviour
+					"AVG loss Agent-Human": avg_loss_2_behaviour,
+					"Angle": angle_3,	#action[:,0].mean(),
+					"Force":force_3,
+					"Angle_ref": angle_ref,
+					"Force_ref": force_ref
+					#"log_prob": log_prob[:,0].mean()
 					}
-					
 					wandb.log(log_dict2)
 				
 			_, evaluation_loss_curve = plt.subplots()
@@ -1360,11 +1515,13 @@ def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, t
 		else:
 			print("load trained model")
 			policy.load('models/TD3_BC'+data_folder+'/TD3_BC_policy')
-
-			plot_action_animated_learnt_policy(train_set, policy, mean_states, std_states, mean_actions, std_actions, agent,  42, data_folder)
-
-			avg_reward, avg_reward_human, avg_loss_2_behaviour = evaluate_agent_performance(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent)
+			ind = test_set['trial'].unique()[42]
+			plot_action_animated_learnt_policy(train_set, policy, mean_states, std_states, mean_actions, std_actions, agent, ind, data_folder)
+			evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent, ind, action_dim, data_folder)
+			print("Evaluation loss: ", evaluation_loss)	
+			avg_reward, avg_reward_human, avg_rewards_h,avg_loss_2_behaviour = evaluate_agent_performance(test_set, policy, mean_states, std_states, mean_actions, std_actions, agent)
 			print(avg_reward, avg_reward_human, avg_loss_2_behaviour)
+
 					
 	elif agent == "AC_Off_POC_TD3":
 		# Initialize Agent
@@ -1415,74 +1572,106 @@ def train(filename, state_dim=14, action_dim=2, epochs=3000, batch_size = 256, t
 ######################### Evaluation ####################################
 def evaluate_agent_performance(dataset, policy, mean_states, std_states, mean_actions, std_actions, agent="TD3_BC"):
 	rewards = []
+	rewards_h = []
 	rewards_human = []
 	losses_2_behaviour_ = []
-	radius = 0.005
-	vertical_margin = 0.001
 
+	c1 = 0
+	c2 = 0
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
-		states, actions, new_states, reward_, terminals= get_trajectory(dataset, trial)
+		states, action_h, new_states, reward_, terminals= get_trajectory(dataset, trial)
 		
+		action_h = action_h.cpu().detach().numpy()*std_actions + mean_actions
 		state = states[0][:]
 		
 		if agent == "CQL_SAC":
-			actions = policy.select_action(states[0,:], eval=True)
+			actions = policy.select_action(states[0,:], eval=True).cpu().detach().numpy()
 		else:
-			actions = policy.select_action(states[0,:])
+			actions = policy.select_action(states[0,:]).cpu().detach().numpy()
 
-		angle = actions[0].cpu().detach().numpy()
-		force = actions[1].cpu().detach().numpy()
-		state = states[0,:].cpu().detach().numpy()
+		state = states[1,:].cpu().detach().numpy()
 		state_cueball = state[0:3]
 		state_cue_front = state[12:15]
 		state_cue_back = state[15:18]
 		target_corner = (state[9:12]*std_states[9:12] + mean_states[9:12])		
 		target_corner_angle = np.rad2deg(np.arctan2(target_corner[2], target_corner[0]))
+		
+		angle = np.rad2deg(np.arctan2(state[20]*std_states[20] + mean_states[20], state[18]*std_states[18] + mean_states[18]))
+		angle_h = action_h[0,0]
+		dt = 0.0111
+		cuevel = ((states[1][[13,14,15]].cpu().detach().numpy()*std_states[12:15] + mean_states[12:15])-(states[0][[13,14,15]].cpu().detach().numpy()*std_states[12:15] + mean_states[12:15]))/dt
+		force = np.linalg.norm(cuevel) 
+		
+		force = action_h[0,1]
+
 		if target_corner_angle < 90.0:
 			corner="right"
 		else:
 			corner="left"
 		reward_human = reward_[terminals == True].cpu().detach().numpy()
 		reward = 0.0
+		reward_h = 0.0
 		#hit_ind = dataset['states'][dataset['trial']==trial].index[-1]-40
 		N = len(states)
-		if N<40:
-			print("Error very small trajectory smaller than 40, to investigate")
-		hit_ind=N-40
-		for k in range(N):
+		
+		#if N<40:
+			#print("Error very small trajectory smaller than 40, to investigate")
+		hit_ind=N-3	#N-40
+		for k in range(1,N):
 			#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-			state_cue_front, state_cue_back, state_cue_direction = update_cuepos(state_cue_front, actions.cpu().detach().numpy(), call="evaluation")
-			#if (state_cue_front[0] - state_cueball[0])**2 + (state_cue_front[2] - state_cueball[2])**2 < radius \
-			#and state_cue_front[1] < state_cueball[1] + vertical_margin:
-			if k >= (hit_ind-2) and k <= (hit_ind+2):
-				#next_state_cueball = update_cueballpos(state_cueball, cuevel)
-				#states[k][0:3] = next_state_cueball
-				losses_2_behaviour_.append(loss_2_behaviour(angle, states[k][18:21].cpu().detach().numpy(), mean_states, std_states, mean_actions, std_actions))
-				reward = compute_reward_evaluation(angle, force, corner, reward, mean_actions, std_actions)	#cuevel
-			states[k][12:15] = torch.tensor(state_cue_front, device=device)
-			states[k][15:18] = torch.tensor(state_cue_back, device=device)
-			states[k][18:21] = torch.tensor(state_cue_direction, device=device)
+			prev_angle = angle
+			prev_angle_h = angle_h
+			angle_h = action_h[k,0]
+			force_h = action_h[k,1]
+			state_cue_front, state_cue_back, state_cue_direction, angle, force = update_cuepos(state_cue_front*std_states[12:15] + mean_states[12:15], actions, angle, force, call="evaluation")
+			
+			states[k][12:15] = torch.tensor(state_cue_front - mean_states[12:15] / std_states[12:15] , device=device)
+			states[k][15:18] = torch.tensor(state_cue_back - mean_states[15:18] / std_states[15:18] , device=device)
+			states[k][18:21] = torch.tensor(state_cue_direction - mean_states[18:21] / std_states[18:21] , device=device)
 			#states[k][21:] = actions[1:]
 			if agent == "CQL_SAC":
-				actions = policy.select_action(states[k,:], eval=True)
+				actions = policy.select_action(states[k,:], eval=True).cpu().detach().numpy()*std_actions + mean_actions
 			else:
-				actions = policy.select_action(states[k,:])
-			angle = actions[0].cpu().detach().numpy()
-			force = actions[1].cpu().detach().numpy()
+				actions = policy.select_action(states[k,:]).cpu().detach().numpy()*std_actions + mean_actions
+			next_angle = actions[0]
+			if k < N-1:
+				next_angle_h = action_h[k+1,0]
+
+			if k > (hit_ind-1) and k < (hit_ind+1):
+				losses_2_behaviour_.append(loss_2_behaviour(angle, states[k][18:21].cpu().detach().numpy(), mean_states, std_states, mean_actions, std_actions))
+				reward = compute_reward_evaluation(prev_angle, angle, next_angle, force, corner, reward, mean_actions, std_actions)	#cuevel
+				reward_h = compute_reward_evaluation(prev_angle_h, angle_h, next_angle_h, force_h, corner, reward_h, mean_actions, std_actions)
+				#if reward_h == 1 and reward_human != 1:
+					#print("reward given for ", angle_h, i)
+		
+		'''if reward_human != reward_h:
+			#print(i, reward_human, reward_h, action_h)
+			if reward_human == 1: 
+				print(i, reward_human, reward_h)
+				c1 += 1
+			elif reward_h == 1:
+				print(i, reward_human, reward_h)
+				c2 += 1
+			else:
+				print("error", i)'''
+		rewards_h = np.append(rewards_h, reward_h)
 		rewards = np.append(rewards, reward)
 		rewards_human = np.append(rewards_human, reward_human)
+	
+	#print("count of mismatch: ", c1, c2)
+	avg_rewards_h = np.sum(rewards_h)/len(rewards_h)
 	avg_rewards = np.sum(rewards)/len(rewards)
 	avg_rewards_human = np.sum(rewards_human)/len(rewards_human)
 	avg_losses_2_behaviour = np.sum(losses_2_behaviour_)/len(losses_2_behaviour_)
 	#print("number of successful trials agent: ", avg_rewards, np.count_nonzero(rewards), rewards)
 	#print("number of successful trials human subject: ", avg_rewards_human, np.count_nonzero(rewards_human), rewards_human)
-	return avg_rewards, avg_rewards_human, avg_losses_2_behaviour
+	return avg_rewards, avg_rewards_human, avg_rewards_h, avg_losses_2_behaviour
 
 			
 def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, mean_actions, std_actions, agent="TD3_BC", iteration=44, action_dim=2, data_folder=""):
 	#losses = []
 	#avg_loss = 0.0
-
+	l=5
 	## Actions Visualisation
 	epoch_loss_ = []
 	epoch_loss_u_ = []
@@ -1519,8 +1708,9 @@ def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, 
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
 		loss = torch.zeros([1,], dtype=torch.float64)
 		states, actions, new_states, reward, terminals= get_trajectory(dataset, trial)
-		if len(states) == 140:
+		if len(states) == l:
 			if torch.any(terminals) == True:
+
 				if reward[terminals] != 0.0:
 					count_successful_trajectory += 1
 					successful_trajectory = np.append(successful_trajectory, i)
@@ -1604,7 +1794,7 @@ def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, 
 							pi_e_u = policy.select_action(states[k][:])
 						pi_b_u = actions[k][:].cpu()
 						epoch_loss_u[k] = F.mse_loss(pi_e_u, pi_b_u)
-						loss += F.mse_loss(pi_e_u, pi_b_u)
+						#loss += F.mse_loss(pi_e_u, pi_b_u)
 
 						## Actions Visualisation
 						angle_b_u[k] = pi_b_u[0].detach().numpy()
@@ -1631,6 +1821,8 @@ def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, 
 					epoch_loss_u_ = np.append(epoch_loss_u_ , epoch_loss_u)
 			else:
 				print("No terminal state in trial ", trial, terminals)
+		else:
+			print("len state of trial ", trial, " is not ", l)
 		## Actions Visualisation
 
 	X_s = []
@@ -1650,14 +1842,15 @@ def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, 
 	magnitude_b_u_ = magnitude_b_u_*std_actions[1] + mean_actions[1]
 	magnitude_e_u_ = magnitude_e_u_*std_actions[1] + mean_actions[1]
 
+
 	for i in range(count_successful_trajectory):   
-		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
-		mean_b.plot(X_s, angle_b_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_s, angle_e_[i*140:(i+1)*140], color='green')
+		X_s = np.arange(successful_trajectory[i]*l, (successful_trajectory[i]+1)*l)
+		mean_b.plot(X_s, angle_b_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_s, angle_e_[i*l:(i+1)*l], color='green')
 	for i in range(count_unsuccessful_trajectory):
-		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
-		mean_b.plot(X_u, angle_b_u_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_u, angle_e_u_[i*140:(i+1)*140], color='red')
+		X_u = np.arange(unsuccessful_trajectory[i]*l, (unsuccessful_trajectory[i]+1)*l)
+		mean_b.plot(X_u, angle_b_u_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_u, angle_e_u_[i*l:(i+1)*l], color='red')
 	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_angle_behaviour_agent.png')
 
 	fig, mean_b = plt.subplots()
@@ -1665,13 +1858,13 @@ def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, 
 	mean_b.set_ylabel("Velocity x-axis")
 	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
 	for i in range(count_successful_trajectory):   
-		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
-		mean_b.plot(X_s,magnitude_b_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_s, magnitude_e_[i*140:(i+1)*140], color='green')
+		X_s = np.arange(successful_trajectory[i]*l, (successful_trajectory[i]+1)*l)
+		mean_b.plot(X_s,magnitude_b_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_s, magnitude_e_[i*l:(i+1)*l], color='green')
 	for i in range(count_unsuccessful_trajectory):
-		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
-		mean_b.plot(X_u, magnitude_b_u_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_u, magnitude_e_u_[i*140:(i+1)*140], color='red')
+		X_u = np.arange(unsuccessful_trajectory[i]*l, (unsuccessful_trajectory[i]+1)*l)
+		mean_b.plot(X_u, magnitude_b_u_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_u, magnitude_e_u_[i*l:(i+1)*l], color='red')
 	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_magnitude_behaviour_agent.png')
 
 	"""fig, mean_b = plt.subplots()
@@ -1679,13 +1872,13 @@ def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, 
 	mean_b.set_ylabel("Velocity z-axis")
 	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
 	for i in range(count_successful_trajectory):   
-		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
-		mean_b.plot(X_s, vel_z_b_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_s, vel_z_e_[i*140:(i+1)*140], color='green')
+		X_s = np.arange(successful_trajectory[i]*l, (successful_trajectory[i]+1)*l)
+		mean_b.plot(X_s, vel_z_b_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_s, vel_z_e_[i*l:(i+1)*l], color='green')
 	for i in range(count_unsuccessful_trajectory):
-		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
-		mean_b.plot(X_u, vel_z_b_u_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_u, vel_z_e_u_[i*140:(i+1)*140], color='red')
+		X_u = np.arange(unsuccessful_trajectory[i]*l, (unsuccessful_trajectory[i]+1)*l)
+		mean_b.plot(X_u, vel_z_b_u_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_u, vel_z_e_u_[i*l:(i+1)*l], color='red')
 	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')"""
 
 	fig, mean_b = plt.subplots()
@@ -1693,11 +1886,11 @@ def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, 
 	mean_b.set_ylabel("MSE loss")
 	fig.suptitle('MSE loss between Behaviour and Agent policy', fontsize=16, y=1.04)  
 	for i in range(count_successful_trajectory):   
-		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
-		mean_b.plot(X_s, epoch_loss_[i*140:(i+1)*140], color='green')
+		X_s = np.arange(successful_trajectory[i]*l, (successful_trajectory[i]+1)*l)
+		mean_b.plot(X_s, epoch_loss_[i*l:(i+1)*l], color='green')
 	for i in range(count_unsuccessful_trajectory):
-		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
-		mean_b.plot(X_u, epoch_loss_u_[i*140:(i+1)*140], color='red')
+		X_u = np.arange(unsuccessful_trajectory[i]*l, (unsuccessful_trajectory[i]+1)*l)
+		mean_b.plot(X_u, epoch_loss_u_[i*l:(i+1)*l], color='red')
 	#fig.tight_layout()
 	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_MSE_loss_between_actions.png')
 
@@ -1707,53 +1900,87 @@ def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, 
 
 def plot_action_animated_learnt_policy(dataset, policy, mean_states, std_states, mean_actions, std_actions, agent="TD3_BC", iteration=44, data_folder=""):
 
-	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[iteration])
+	states,actions_behaviour,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[42])	#iteration
 	fig, ax = plt.subplots(1,1)
 	ref_cueposfront = states[:,12:15].cpu().clone().detach()*std_states[12:15] + mean_states[12:15]
 	ref_cueposback = states[:,15:18].cpu().clone().detach()*std_states[15:18] + mean_states[15:18]
 	cueposfront = np.zeros((states.shape[0],3))
 	cueposback = np.zeros((states.shape[0],3))
 	cuedirection = np.zeros((states.shape[0],3))
-	cueposfront[0][0] = states[0,12]
-	cueposfront[0][1] = states[0,13]
-	cueposfront[0][2] = states[0,14]
-	cueposback[0][0] = states[0,15]
-	cueposback[0][1] = states[0,16]
-	cueposback[0][2] = states[0,17]
-	cuedirection[0][0] = states[0,18] 
-	cuedirection[0][1] = states[0,19]
-	cuedirection[0][2] = states[0,20]
 
+	cueposfront[0][0:3] = states[0,12:15].cpu()*std_states[12:15] + mean_states[12:15]
+	cueposfront[1][0:3] = states[1,12:15].cpu()*std_states[12:15] + mean_states[12:15]
+	cueposback[0][0:3] = states[0,15:18].cpu()*std_states[15:18] + mean_states[15:18]
+	cueposback[1][0:3] = states[1,15:18].cpu()*std_states[15:18] + mean_states[15:18]
+	cuedirection[1][0:3] = states[1,18:21].cpu()*std_states[18:21] + mean_states[18:21] 
+
+	angle_=[]
+	angle_b=[]
+	force_=[]
+	force_b=[]
+	angle = np.rad2deg(np.arctan2(cuedirection[1][2], cuedirection[1][0]))
+	dt = 0.0111
+	cuevel = (cueposfront[1][:]*std_states[12:15] + mean_states[12:15]-cueposfront[0][:]*std_states[12:15] + mean_states[12:15])/dt
+	force = np.linalg.norm(cuevel) 
+	angle_.append(angle)
+	force_.append(force)
+	angle_b.append(angle)
+	force_b.append(force)
 	if agent == "CQL_SAC":
-		actions = policy.select_action(states[0,:], eval=True)
+		actions = policy.select_action(states[1,:], eval=True)
 	else:
-		actions = policy.select_action(states[0,:])
+		actions = policy.select_action(states[1,:])
 	
 	#vel = [0,0,0]
-	for i in range(states.shape[0]):
+	for i in range(0, states.shape[0]-1):
 		a = actions.detach().numpy()*std_actions + mean_actions
-		cueposfront[i][:] , cueposback[i][:], cuedirection[i][:] = update_cuepos(cueposfront[i][:], a, call="plot")		#, vel, vel)
+		a_b = actions_behaviour[i,:].cpu().detach().numpy()*std_actions+ mean_actions
+		angle_b.append(a_b[0])	#angle +
+		force_b.append(a_b[1])	#force+
+
+		#print(actions, a,cueposfront[i][:] , cueposback[i][:], cuedirection[i][:] )
+		cueposfront[i+1][:] , cueposback[i+1][:], cuedirection[i+1][:], angle, force = update_cuepos(cueposfront[i][:], a, angle, force, call="plot")	#*std_states[12:15] + mean_states[12:15]	#, vel, vel)
+		angle_.append(a[0])	#angle)
+		force_.append(a[1])	#force)
 		#cueposfront[i][:] , cueposback[i][:], vel = update_cuepos(cueposfront[i-1][:],vel, actions)
 		#cueposfront2[i][:] = actions[:3]
 		#cueposback2[i][:] = actions[3:6]
 		#update states
-		states[i,12] = cueposfront[i][0] - mean_states[12] / std_states[12] 
-		states[i,13] = cueposfront[i][1] - mean_states[13] / std_states[13]
-		states[i,14] = cueposfront[i][2] - mean_states[14] / std_states[14]
-		states[i,15] = cueposback[i][0] - mean_states[15] / std_states[15]
-		states[i,16] = cueposback[i][1] - mean_states[16] / std_states[16]
-		states[i,17] = cueposback[i][2] - mean_states[17] / std_states[17]
-		states[i,18] = cuedirection[i][0] - mean_states[18] / std_states[18]
-		states[i,19] = cuedirection[i][1] - mean_states[19] / std_states[19]
-		states[i,20] = cuedirection[i][2] - mean_states[20] / std_states[20]
+		states[i+1,12] = cueposfront[i+1][0] #- mean_states[12] / std_states[12] 
+		states[i+1,13] = cueposfront[i+1][1] #- mean_states[13] / std_states[13]
+		states[i+1,14] = cueposfront[i+1][2] #- mean_states[14] / std_states[14]
+		states[i+1,15] = cueposback[i+1][0] #- mean_states[15] / std_states[15]
+		states[i+1,16] = cueposback[i+1][1] #- mean_states[16] / std_states[16]
+		states[i+1,17] = cueposback[i+1][2] #- mean_states[17] / std_states[17]
+		states[i+1,18] = cuedirection[i+1][0] #- mean_states[18] / std_states[18]
+		states[i+1,19] = cuedirection[i+1][1] #- mean_states[19] / std_states[19]
+		states[i+1,20] = cuedirection[i+1][2] #- mean_states[20] / std_states[20]
 		#states[i,21] = actions[1]
 		#states[i,22] = actions[2]
 		#states[i,23] = actions[3]
 		if agent == "CQL_SAC":
-			actions = policy.select_action(states[i,:], eval=True)
+			actions = policy.select_action(states[i+1,:], eval=True)
 		else:
-			actions = policy.select_action(states[i,:])
+			actions = policy.select_action(states[i+1,:])
 
+	
+	fig, ax = plt.subplots()
+	ax.set_xlabel("timesteps")
+	ax.set_ylabel("Angle")
+	fig.suptitle('Angle', fontsize=16, y=1.04)
+	X = np.arange(0, states.shape[0])
+	ax.plot(X, angle_, color='blue')
+	ax.plot(X, angle_b, color='orange')
+	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_angle_animation.png')
+
+	
+	fig2, ax2 = plt.subplots()
+	ax2.set_xlabel("timesteps")
+	ax2.set_ylabel("Force")
+	fig2.suptitle('Force', fontsize=16, y=1.04)
+	ax2.plot(X, force_, color='blue')
+	ax2.plot(X, force_b, color='orange')
+	fig2.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_force_animation.png')
 	#actions = policy.select_action(states).detach().numpy()
 	#cueposfront = actions[:,1:3]
 	#cueposback = actions[:,3:5]
@@ -1762,16 +1989,16 @@ def plot_action_animated_learnt_policy(dataset, policy, mean_states, std_states,
 	cueballpos[0][0] = states[0][0]
 	cueballpos[0][1] = states[0][2]
 	
+
 	def animate(i):
 		ax.clear()
 		x_ref = [ref_cueposback[i,0], ref_cueposfront[i,0]]
 		z_ref = [ref_cueposback[i,2], ref_cueposfront[i,2]]
-		ax.plot(x_ref, z_ref, color="green", label = 'reference stick')
-
+		ax.plot(x_ref, z_ref, color="green", label = 'reference stick '+str(round(angle_b[i],3))+"°")
 
 		x_values = [cueposback[i][0], cueposfront[i][0]]
 		z_values = [cueposback[i][2], cueposfront[i][2]]
-		ax.plot(x_values, z_values, color="blue", label = 'Agent cue stick')
+		ax.plot(x_values, z_values, color="blue", label = 'Agent cue stick '+str(round(angle_[i],3))+"°")
 
 		
 		"""x_values = [cueposback2[i][0], cueposfront2[i][0]]
@@ -1786,9 +2013,10 @@ def plot_action_animated_learnt_policy(dataset, policy, mean_states, std_states,
 		ax.scatter(states[i][9]*std_states[9] + mean_states[9], states[i][11]*std_states[11] + mean_states[11], s=200, facecolors='none', edgecolors='green', label = 'pocket')
 		ax.set(xlim=(-1, 1), ylim=(-2, 2))
 		ax.legend()
+		#ax.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_animation'+str(i)+'.png')
 
 
-	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=40, repeat=False)	
+	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=400, repeat=False)	
 	plt.close()
 	anim.save('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')	
 
@@ -1796,35 +2024,14 @@ def plot_action_animated_learnt_policy(dataset, policy, mean_states, std_states,
 ########################## Main  ########################################
 
 if __name__ == "__main__":
-	data_folder = "_2_delta_target"	#"_original" #"_acc"	
-	agent = "TD3_BC"		#"CQL_SAC"	#"TD3_BC"
+	data_folder = "_original"	#delta_original"	#"_original" #"_acc"	
+	agent = "CQL_SAC"		#"CQL_SAC"	#"TD3_BC"
 
-	filename = ["data"+data_folder+"/AAB_Offline_reduced.csv", "data"+data_folder+"/AE_Offline_reduced.csv", "data"+data_folder+"/AK_Offline_reduced.csv",
-			"data"+data_folder+"/AS_Offline_reduced.csv", "data"+data_folder+"/BL_Offline_reduced.csv", "data"+data_folder+"/BR_Offline_reduced.csv",
-			"data"+data_folder+"/BY_Offline_reduced.csv", "data"+data_folder+"/CP_Offline_reduced.csv", "data"+data_folder+"/CX_Offline_reduced.csv",
-			"data"+data_folder+"/DR_Offline_reduced.csv", "data"+data_folder+"/DS_Offline_reduced.csv", "data"+data_folder+"/DZ_Offline_reduced.csv",
-			"data"+data_folder+"/ES_Offline_reduced.csv", "data"+data_folder+"/ESS_Offline_reduced.csv", "data"+data_folder+"/GS_Offline_reduced.csv",
-			"data"+data_folder+"/HL_Offline_reduced.csv", "data"+data_folder+"/HZ_Offline_reduced.csv", "data"+data_folder+"/IK_Offline_reduced.csv",
-			"data"+data_folder+"/JG_Offline_reduced.csv", "data"+data_folder+"/JH_Offline_reduced.csv", "data"+data_folder+"/JR_Offline_reduced.csv",
-			"data"+data_folder+"/JW_Offline_reduced.csv", "data"+data_folder+"/JY_Offline_reduced.csv", "data"+data_folder+"/KO_Offline_reduced.csv",
-			"data"+data_folder+"/LR_Offline_reduced.csv", "data"+data_folder+"/MA_Offline_reduced.csv", "data"+data_folder+"/MAI_Offline_reduced.csv",
-			"data"+data_folder+"/MG_Offline_reduced.csv", "data"+data_folder+"/MO_Offline_reduced.csv", "data"+data_folder+"/PM_Offline_reduced.csv",
-			"data"+data_folder+"/RA_Offline_reduced.csv", "data"+data_folder+"/SC_Offline_reduced.csv", "data"+data_folder+"/SF_Offline_reduced.csv",
-			"data"+data_folder+"/TA_Offline_reduced.csv", "data"+data_folder+"/TH_Offline_reduced.csv", "data"+data_folder+"/TS_Offline_reduced.csv",
-			"data"+data_folder+"/VB_Offline_reduced.csv", "data"+data_folder+"/WZ_Offline_reduced.csv", "data"+data_folder+"/YC_Offline_reduced.csv",
-			"data"+data_folder+"/YH_Offline_reduced.csv"]
-	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"]
-	"""["RL_dataset/Offline_reduced_2_original/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/BL_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced_2_original/CP_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/CX_Offline_reduced.csv", 
-			"RL_dataset/Offline_reduced_2_original/GS_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/HZ_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced_2_original/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/JW_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced_2_original/KO_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/LR_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced_2_original/MA_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/MAI_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced_2_original/MO_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/SC_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced_2_original/SF_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/TA_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced_2_original/TH_Offline_reduced.csv", "RL_dataset/Offline_reduced_2_original/TS_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced_2_original/YH_Offline_reduced.csv"]"""
+	filename = []
+	for i, file in enumerate(sorted(os.listdir("data"+data_folder))):
+		#if file.endswith("3t_left.csv"):	#left
+		filename.append("data"+data_folder+"/"+file)
 
-	policy = train(filename, state_dim=21, action_dim=2, epochs=500000, batch_size=256, train=True, agent=agent, data_folder=data_folder)	#state_dim=16 #TD3_BC #set train=False to load pretrained model
+	policy = train(filename, state_dim=21, action_dim=2, epochs=1000000, batch_size=256, train=True, agent=agent, data_folder=data_folder)	#state_dim=16 #TD3_BC #set train=False to load pretrained model
 
 	#evaluate_agent_performance(test_set, policy, agent=agent)

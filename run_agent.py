@@ -100,45 +100,53 @@ def update_cueballpos(prev_pos, velocity):
     new_pos = prev_pos + velocity*dt
     return new_pos
 
-def update_cuepos(prev_pos_front, actions, call="plot"): #, vel
+def update_cuepos(prev_pos_front, actions, prev_angle, prev_force, call="plot"): #, vel
     dt = 0.0111
     len_cue_stick = 1.21	#fixed value approximate over all subjects and trials, but not important to be precise, just for visualisation
     
-    #acceleration = actions[1:]*(329+282)-282 
-    #new_vel = vel + acceleration*dt 
-
-    new_vel = actions[1:]*(3 + 3) - 3
-    angle = actions[0]*(135 - 45)+45
-    #print("action angle: ", angle)
-    angle_complementary = 180-angle
-    new_pos_front = prev_pos_front + new_vel*dt
-    new_pos_back = [new_pos_front[0] + len_cue_stick*np.cos(np.radians(-angle_complementary)),0, new_pos_front[2] + len_cue_stick*np.sin(np.radians(-angle_complementary))]   #0 on y 
+    new_force = actions[1]  #prev_force+
+    new_angle = actions[0]  #prev_angle+
+    new_vel = np.array([new_force*np.cos(np.radians(new_angle)),0,new_force*np.sin(np.radians(new_angle))])      #Warning not the best to set y vel to 0 should find another way
+    #print("action angle: ", angle) 
+    angle_complementary = 180-new_angle
+    new_pos_front = prev_pos_front + new_vel * dt
+    new_pos_back = np.array([new_pos_front[0] + len_cue_stick*np.cos(np.radians(-angle_complementary)),0, new_pos_front[2] + len_cue_stick*np.sin(np.radians(-angle_complementary))])   #0 on y 
 
     new_cue_dir = (new_pos_front - new_pos_back)/np.linalg.norm((new_pos_front - new_pos_back))
     #print("new cue dir: ", new_cue_dir)
-    if call=="evaluation":
+    return new_pos_front, new_pos_back, new_cue_dir, new_angle, new_force
+    """if call=="evaluation":
         return torch.tensor(new_pos_front, device=device), torch.tensor(new_pos_back, device=device), torch.tensor(new_cue_dir, device=device)			#, new_vel
     else:
-        return new_pos_front, new_pos_back, new_cue_dir
+        return new_pos_front, new_pos_back, new_cue_dir"""
 
-def compute_reward_evaluation(angle, target_corner, reward):	#cuevel
-    target_corner_angle = np.rad2deg(np.arctan2(target_corner[2], target_corner[0]))
-    #angle = np.rad2deg(np.arctan2(cuevel[2], cuevel[0]))
-    angle = angle*(135 - 45)+45
-    print("pred angle: ", angle)
-    if target_corner_angle < 90.0:
+def compute_reward_evaluation(prev_angle, angle, next_angle, force, target_corner, reward, mean_actions, std_actions):	#cuevel
+    #angle = angle*std_actions[0] + mean_actions[0]
+    #force = force*std_actions[1] + mean_actions[1]
+    #print("pred angle: ", angle)
+    if target_corner == "right":
         angle = 180 - angle
-    mean_pocket = 105.0736
-    lbPocket = mean_pocket - 0.32	#0.3106383 #= 104.7629617
-    ubPocket = mean_pocket + 0.26	#0.2543617 #= 105.3279617
+        prev_angle = 180 - prev_angle
+    mean_pocket = 104.94109114059208 #105.0736 
+    lbPocket = mean_pocket - 0.9208495903864685	#0.3106383 #= 104.7629617
+    ubPocket = mean_pocket + 0.9208495903864685	#0.2543617 #= 105.3279617
+    lbPocket_extended = mean_pocket - 0.9208495903864685	#0.3106383 #= 104.7629617
+    ubPocket_extended = mean_pocket + 0.9208495903864685	#0.2543617 #= 105.3279617
 
     if reward != 1.0:
-        if angle <= ubPocket and angle >= lbPocket:     #Mathf.Max(currentTargetAngle, 
-            reward = 1.0
-            print("Funnel")
-        else:
-            reward = 0
+        if force > 0.1:
+            if angle <= ubPocket and angle >= lbPocket:     #Mathf.Max(currentTargetAngle, 
+                #if prev_angle <= ubPocket_extended and prev_angle >= lbPocket_extended:
+                    #if next_angle <= ubPocket_extended and next_angle >= lbPocket_extended:
+            	reward = 1.0
+                    #print("Funnel")
     return reward
+
+def loss_2_behaviour(angle, cuedir, mean_states, std_states, mean_actions, std_actions):
+	cuedir = cuedir*std_states[18:21] + mean_states[18:21]
+	label_angle = np.rad2deg(np.arctan2(cuedir[2], cuedir[0]))
+	angle = angle	#*std_actions[0]+mean_actions[0]
+	return (angle - label_angle)**2	#F.mse_loss(angle, label_angle)
 
 
 def weighted_sample(dic,prob_dist):
@@ -279,10 +287,10 @@ class Actor(nn.Module):
 	def __init__(self, state_dim, action_dim, max_action):
 		super(Actor, self).__init__()
 		self.l1 = nn.Linear(state_dim, 256)
-		self.l2 = nn.Linear(256, 512)
-		self.l3 = nn.Linear(512, 256)
+		self.l2 = nn.Linear(256,256)	# 512)
+		#self.l3 = nn.Linear(512, 256)
 		self.l4 = nn.Linear(256, action_dim)
-		self.dropout = nn.Dropout(0.25)
+		#self.dropout = nn.Dropout(0.25)
 		#self.actions_upper_bound = torch.tensor([1,1,1,1,1,1,1,1,0.2,1])#,1,1])    #135
 		#self.actions_lower_bound = torch.tensor([0,0,0,0,0,0,-1,-1,-0.2,-1])#,-1,-1])  #45
 		self.max_action = max_action
@@ -290,11 +298,11 @@ class Actor(nn.Module):
 
 	def forward(self, state):
 		a = F.relu(self.l1(state))
-		a = self.dropout(a)
+		#a = self.dropout(a)
 		a = F.relu(self.l2(a))
-		a = self.dropout(a)
-		a = F.relu(self.l3(a))
-		a = self.dropout(a)
+		#a = self.dropout(a)
+		#a = F.relu(self.l3(a))
+		#a = self.dropout(a)
 		a = torch.tanh(self.l4(a))
 		#rescaled_actions = self.actions_lower_bound + (self.actions_upper_bound - self.actions_lower_bound) * (a + 1) / 2
 		return 	a	#rescaled_actions #torch.tanh(self.l4(a))
@@ -304,34 +312,34 @@ class Critic(nn.Module):
 		super(Critic, self).__init__()
 		# Q1 architecture
 		self.l1 = nn.Linear(state_dim + action_dim, 256)
-		self.l2 = nn.Linear(256, 512)
-		self.l3 = nn.Linear(512, 256)
+		self.l2 = nn.Linear(256,256)	# 512)
+		#self.l3 = nn.Linear(512, 256)
 		self.l4 = nn.Linear(256, 1)
-		self.dropout = nn.Dropout(0.25)
+		#self.dropout = nn.Dropout(0.25)
 
 		# Q2 architecture
 		self.l5 = nn.Linear(state_dim + action_dim, 256)
-		self.l6 = nn.Linear(256,512)
-		self.l7 = nn.Linear(512, 256)
+		self.l6 = nn.Linear(256,256)	#512)
+		#self.l7 = nn.Linear(512, 256)
 		self.l8 = nn.Linear(256, 1)
 
 
 	def forward(self, state, action):
 		sa = torch.cat([state, action], 1)
 		q1 = F.relu(self.l1(sa))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
 		q1 = F.relu(self.l2(q1))
-		q1 = self.dropout(q1)
-		q1 = F.relu(self.l3(q1))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
+		#q1 = F.relu(self.l3(q1))
+		#q1 = self.dropout(q1)
 		q1 = self.l4(q1)
 
 		q2 = F.relu(self.l5(sa))
-		q2 = self.dropout(q2)
+		#q2 = self.dropout(q2)
 		q2 = F.relu(self.l6(q2))
-		q2 = self.dropout(q2)
-		q2 = F.relu(self.l7(q2))
-		q2 = self.dropout(q2)
+		#q2 = self.dropout(q2)
+		#q2 = F.relu(self.l7(q2))
+		#q2 = self.dropout(q2)
 		q2 = self.l8(q2)
 		return q1, q2
 
@@ -340,11 +348,11 @@ class Critic(nn.Module):
 		sa = torch.cat([state, action], 1)
 
 		q1 = F.relu(self.l1(sa))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
 		q1 = F.relu(self.l2(q1))
-		q1 = self.dropout(q1)
-		q1 = F.relu(self.l3(q1))
-		q1 = self.dropout(q1)
+		#q1 = self.dropout(q1)
+		#q1 = F.relu(self.l3(q1))
+		#q1 = self.dropout(q1)
 		q1 = self.l4(q1)
 		return q1
 
@@ -370,7 +378,7 @@ class TD3_BC(nn.Module):
 
 		self.critic = Critic(state_dim, action_dim).to(device)
 		self.critic_target = copy.deepcopy(self.critic)
-		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)	
+		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)	
 		#self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=10000, gamma=1e-5)
 
 		self.max_action = max_action
@@ -394,9 +402,9 @@ class TD3_BC(nn.Module):
 		actor_loss = torch.tensor(0.0, device = device)
 		critic_loss = torch.tensor(0.0, device = device)
 		# Sample replay buffer 
-		#states, actions, new_states, rewards, not_terminals = trajectory.sample(256)
-		states, actions, new_states, rewards, terminals = experience 
-		not_terminals = ~terminals#.reshape(-1,1)
+		#states, actions, new_states, rewards, terminals = experience 
+		#not_terminals = ~terminals#.reshape(-1,1)
+		states, actions, new_states, rewards, not_terminals = experience 
 		with torch.no_grad():
 			# Select action according to policy and add clipped noise
 			noise = (
@@ -739,9 +747,10 @@ class CQLSAC(nn.Module):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
+        self.epoch = 0
         
         self.gamma = 0.99
-        self.tau = 1e-2
+        self.tau = 2e-3
         hidden_size = 256
         hidden_size2 = 256
         learning_rate = 3e-5
@@ -759,7 +768,7 @@ class CQLSAC(nn.Module):
         self.with_lagrange = True
         self.temp = 1.0
         self.cql_weight = 1.0
-        self.target_action_gap = 0.0
+        self.target_action_gap = 5.0
         self.cql_log_alpha = torch.zeros(1, requires_grad=True)
         self.cql_alpha_optimizer = optim.Adam(params=[self.cql_log_alpha], lr=learning_rate) 
         
@@ -832,6 +841,7 @@ class CQLSAC(nn.Module):
             experiences (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples 
             gamma (float): discount factor
         """
+        self.epoch += 1
         # Sample replay buffer 
         states, actions, next_states, rewards, not_dones = experiences
         #states, actions, next_states, rewards, dones = experiences
@@ -924,6 +934,7 @@ class CQLSAC(nn.Module):
         total_c1_loss.backward(retain_graph=True)
         clip_grad_norm_(self.critic1.parameters(), self.clip_grad_param)
         self.critic1_optimizer.step()
+        
         # critic 2
         self.critic2_optimizer.zero_grad()
         total_c2_loss.backward()
@@ -943,7 +954,7 @@ class CQLSAC(nn.Module):
         actor_losses_.append(actor_loss.item())"""
         #return actor_losses_, alpha_losses_, critic1_losses_, critic2_losses_,cql1_scaled_losses_, cql2_scaled_losses_
         #return actor_loss.item(), alpha_loss.item(), critic1_loss.item(), critic2_loss.item(), cql1_scaled_loss.item(), cql2_scaled_loss.item()	#, current_alpha, cql_alpha_loss.item(), cql_alpha.item()
-        return actor_loss.cpu().detach(), alpha_loss.cpu().detach(), critic1_loss.cpu().detach(), critic2_loss.cpu().detach(),cql1_scaled_loss.cpu().detach(), cql2_scaled_loss.cpu().detach()
+        return actor_loss.cpu().detach(), alpha_loss.cpu().detach(), critic1_loss.cpu().detach(), critic2_loss.cpu().detach(),cql1_scaled_loss.cpu().detach(), cql2_scaled_loss.cpu().detach(), total_c1_loss.cpu().detach(), total_c2_loss.cpu().detach()
 
 
     def soft_update(self, local_model , target_model):
@@ -998,7 +1009,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, batch_size
         "expl_noise": 0.1,
         "batch_size": 256,
         "discount": 0.99,
-        "tau": 0.005,
+        "tau": 0.0005,
         "policy_noise": 0.2,
         "noise_clip": 0.5,
         "policy_freq": 2,
@@ -1028,26 +1039,29 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, batch_size
 		"alpha": args['alpha']
 	    }
 
-	### Logs wandb	###
-	
-	wandb.init(project="reward-learning", config=args)
 	
 	#wandb.define_metric("epoch")
 	# define which metrics will be plotted against it
-	wandb.define_metric("actor loss")	#, step_metric="epoch")
+	#wandb.define_metric("actor loss")	#, step_metric="epoch")
 	#wandb.define_metric("critic loss", step_metric="epoch")
 
 	if agent == "CQL_SAC":
 		# Initialize Agent
 		policy = CQLSAC(state_dim,action_dim)
 		
-		# Magic
-		wandb.watch(policy, log_freq=500)
 
 		print("---------------------------------------")
 		print(f"Policy: {agent}")
 		print("---------------------------------------")
 		if train == True:
+			#print("load pretrained model")
+			#policy.load('models/CQL_SAC'+data_folder+'/CQL_SAC_policy')
+			
+			### Logs wandb	###
+			
+			wandb.init(project="CQL",name="CQL_D4RL", config=args)
+			# Magic
+			wandb.watch(policy, log_freq=500)
 			alpha_losses = []
 			critic1_losses = []
 			critic2_losses = []
@@ -1076,27 +1090,33 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, batch_size
 			for i in tqdm(range(1, epochs)):
 				#experience = weighted_sample_experience(dataset, sample_size=256)   #trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
 				experience = replay_buffer.sample(batch_size)
-				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss= policy.train(experience)
+				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss, total_c1_loss, total_c2_loss = policy.train(experience)	#trajectory
 				alpha_losses.append(alpha_loss.numpy())
 				critic1_losses.append(critic1_loss.numpy()) # + cql1_scaled_loss)
 				critic2_losses.append(critic2_loss.numpy()) # + cql2_scaled_loss)
 				actor_losses.append(actor_loss.numpy())
 				cql1_scaled_losses.append( cql1_scaled_loss.numpy())
 				cql2_scaled_losses.append(cql2_scaled_loss.numpy())
-
+				#total_c1_losses.append(total_c1_loss.numpy())
+				#total_c2_losses.append(total_c2_loss.numpy())
 				wandb.log({"actor loss": actor_loss, 
-							"critic 1 loss": critic1_loss, 
-							"critic 2 loss": critic2_loss,
-							"alpha loss": alpha_loss,
-							"cql 1 loss": cql1_scaled_loss,
-							"cql 2 loss": cql2_scaled_loss})
-				if i%10000 == 0:
-					eval_reward = eval_policy(policy,env_name, 42, mean,std)
-					wandb.log({"Test Reward": eval_reward})
-				"""if (i%2000 == 0 and i<10000) or i%10000 == 0:
-					plot_action_animated_learnt_policy(train_set, policy,"CQL_SAC",  i, data_folder)
+						"critic 1 loss": critic1_loss,
+						"critic 2 loss": critic2_loss, 
+						"alpha loss": alpha_loss,
+						"cql 1 loss": cql1_scaled_loss,
+						"cql 2 loss": cql2_scaled_loss,
+						"total c1 loss": total_c1_loss,
+						"total c2 loss": total_c2_loss
+						})
+				if (i%200 == 0 and i<10000) or i%5000 == 0:
+					avg_reward, d4rl_score = eval_policy(policy,env_name, 42, mean,std)
+					wandb.log({"AVG Reward": avg_reward,
+								"D4RL score": d4rl_score})
+				if i%5000==0:	#(i%2000 == 0 and i<10000) or i%10000 == 0
+					policy.save('models/CQL_SAC'+data_folder+'/CQL_SAC_policy')
+					#plot_action_animated_learnt_policy(train_set, policy,"CQL_SAC",  i, data_folder)
 
-				if (i%1000 == 0 and i<10000) or i%5000 == 0:
+				"""if (i%1000 == 0 and i<10000) or i%5000 == 0:
 					#evaluate_agent_performance(test_set, policy)
 					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, "CQL_SAC",i , action_dim, data_folder)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
@@ -1132,25 +1152,95 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, batch_size
 		else:
 			print("load trained model")
 			policy.load('models/CQL_SAC'+data_folder+'/CQL_SAC_policy')
+			### Logs wandb	###
+			run_id = "good-sponge-7"
+			wandb.init(project="CQL", id=run_id, resume="must", config=args)
+			# Magic
+			wandb.watch(policy, log_freq=500)
+			alpha_losses = []
+			critic1_losses = []
+			critic2_losses = []
+			cql1_scaled_losses = []
+			cql2_scaled_losses = []
+			actor_losses = []
+			evaluation_losses = []
+            
+			############# D4RL #############
+			evaluations=[]
+			evaluations2=[]
+			env_name = "halfcheetah-medium-v2"
+			env = gym.make(env_name)
+			seed = 0
+			# Set seeds
+			env.seed(seed)
+			env.action_space.seed(seed)
+			torch.manual_seed(seed)
+			np.random.seed(seed)
 
+			replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
+			replay_buffer.convert_D4RL(d4rl.qlearning_dataset(env))
+			mean,std = replay_buffer.normalize_states() 
+			############# D4RL #############
+
+			for i in tqdm(range(1, epochs)):
+				#experience = weighted_sample_experience(dataset, sample_size=256)   #trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
+				experience = replay_buffer.sample(batch_size)
+				actor_loss, alpha_loss, critic1_loss, critic2_loss, cql1_scaled_loss, cql2_scaled_loss, total_c1_loss, total_c2_loss= policy.train(experience)
+				alpha_losses.append(alpha_loss.numpy())
+				critic1_losses.append(critic1_loss.numpy()) # + cql1_scaled_loss)
+				critic2_losses.append(critic2_loss.numpy()) # + cql2_scaled_loss)
+				actor_losses.append(actor_loss.numpy())
+				cql1_scaled_losses.append( cql1_scaled_loss.numpy())
+				cql2_scaled_losses.append(cql2_scaled_loss.numpy())
+
+				wandb.log({"actor loss": actor_loss, 
+							"critic 1 loss": critic1_loss, 
+							"critic 2 loss": critic2_loss,
+							"alpha loss": alpha_loss,
+							"cql 1 loss": cql1_scaled_loss,
+							"cql 2 loss": cql2_scaled_loss})
+				if i%5000 == 0:
+					avg_reward, d4rl_score = eval_policy(policy,env_name, 42, mean,std)
+					wandb.log({"AVG Reward": avg_reward,
+								"D4RL score": d4rl_score})
 	elif agent == "TD3_BC":
 		# Initialize Agent
 		policy = TD3_BC(**kwargs) 
-
-		# Magic
-		wandb.watch(policy, log_freq=500)
 
 		print("---------------------------------------")
 		print(f"Policy: {agent}")	#, Seed: {args['seed']}")
 		print("---------------------------------------")
 		if train == True:
+			### Logs wandb	###
+			
+			wandb.init(project="TD3", config=args)
+			# Magic
+			wandb.watch(policy, log_freq=500)
 			a_losses = []
 			c_losses = []
 			evaluation_losses = []
 			actor_loss = 0.0
+			
+			############# D4RL #############
+			evaluations=[]
+			evaluations2=[]
+			env_name = "halfcheetah-medium-v2"
+			env = gym.make(env_name)
+			seed = 0
+			# Set seeds
+			env.seed(seed)
+			env.action_space.seed(seed)
+			torch.manual_seed(seed)
+			np.random.seed(seed)
+
+			replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
+			replay_buffer.convert_D4RL(d4rl.qlearning_dataset(env))
+			mean,std = replay_buffer.normalize_states() 
+			############# D4RL #############
 
 			for i in tqdm(range(1, epochs)):
-				experience = weighted_sample_experience(dataset, sample_size=256)    #weighted_sample(dataset, prob_dist) #sample(dataset) 	  
+				#experience = weighted_sample_experience(dataset, sample_size=256)   #trajectory = weighted_sample(dataset, prob_dist)    #sample(dataset) 
+				experience = replay_buffer.sample(batch_size)  
 				c_loss, a_loss = policy.train(experience, batch_size = 256) #replay_buffer #, args, **kwargs
 				if a_loss != 0.0:	#actor loss updated only once every "policy_freq" update, set to 0 otherwise
 					a_losses.append(a_loss.numpy())
@@ -1159,7 +1249,11 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, batch_size
 				
 				wandb.log({"actor loss": actor_loss, "critic loss": c_loss})
 
-				if (i%2000 == 0 and i<10000) or i%10000 == 0:
+				if (i%200 == 0 and i<10000) or i%5000 == 0:
+					avg_reward, d4rl_score = eval_policy(policy,env_name, 42, mean,std)
+					wandb.log({"AVG Reward": avg_reward,
+								"D4RL score": d4rl_score})
+				'''if (i%2000 == 0 and i<10000) or i%10000 == 0:
 					#plot_animated_learnt_policy(test_set, policy,"TD3_BC",  i)
 					#plot_3D_animated_learnt_policy(train_set, policy,"TD3_BC",  i)
 					plot_action_animated_learnt_policy(train_set, policy, agent,  i, data_folder)
@@ -1168,7 +1262,7 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, batch_size
 					#evaluate_agent_performance(test_set, policy)
 					evaluation_loss = evaluate_close_to_human_behaviour(test_set, policy, agent,i, action_dim, data_folder)
 					evaluation_losses = np.append(evaluation_losses, evaluation_loss.detach().numpy())
-					policy.save('models/TD3_BC'+data_folder+'/TD3_BC_policy')
+					policy.save('models/TD3_BC'+data_folder+'/TD3_BC_policy')'''
 				
 			_, evaluation_loss_curve = plt.subplots()
 			evaluation_loss_curve.plot(evaluation_losses)
@@ -1233,62 +1327,108 @@ def train(dataset, test_set, state_dim=14, action_dim=2, epochs=3000, batch_size
 		policy=None
 	return policy
 ######################### Evaluation ####################################
-def evaluate_agent_performance(dataset, policy, agent="TD3_BC"):
+def evaluate_agent_performance(dataset, policy, mean_states, std_states, mean_actions, std_actions, agent="TD3_BC"):
 	rewards = []
+	rewards_h = []
 	rewards_human = []
-	radius = 0.001
-	vertical_margin = 0.001
+	losses_2_behaviour_ = []
 
+	c1 = 0
+	c2 = 0
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
-		states, actions, new_states, reward_, terminals= get_trajectory(dataset, trial)
+		states, action_h, new_states, reward_, terminals= get_trajectory(dataset, trial)
 		
+		action_h = action_h.cpu().detach().numpy()*std_actions + mean_actions
 		state = states[0][:]
 		
 		if agent == "CQL_SAC":
-			actions = policy.select_action(states[0,:], eval=True)
+			actions = policy.select_action(states[0,:], eval=True).cpu().detach().numpy()
 		else:
-			actions = policy.select_action(states[0,:])
-		cuevel = actions[1:].cpu().detach().numpy()
-		angle = actions[0].cpu().detach().numpy()
-		state = states[0,:].cpu().detach().numpy()
+			actions = policy.select_action(states[0,:]).cpu().detach().numpy()
+
+		state = states[1,:].cpu().detach().numpy()
 		state_cueball = state[0:3]
 		state_cue_front = state[12:15]
 		state_cue_back = state[15:18]
+		target_corner = (state[9:12]*std_states[9:12] + mean_states[9:12])		
+		target_corner_angle = np.rad2deg(np.arctan2(target_corner[2], target_corner[0]))
+		
+		angle = np.rad2deg(np.arctan2(state[20]*std_states[20] + mean_states[20], state[18]*std_states[18] + mean_states[18]))
+		angle_h = action_h[0,0]
+		dt = 0.0111
+		cuevel = ((states[1][[13,14,15]].cpu().detach().numpy()*std_states[12:15] + mean_states[12:15])-(states[0][[13,14,15]].cpu().detach().numpy()*std_states[12:15] + mean_states[12:15]))/dt
+		force = np.linalg.norm(cuevel) 
+		
+		force = action_h[0,1]
+
+		if target_corner_angle < 90.0:
+			corner="right"
+		else:
+			corner="left"
 		reward_human = reward_[terminals == True].cpu().detach().numpy()
 		reward = 0.0
-		#terminals_ind = dataset['trial'][dataset['terminals']==True]
-		for trial in dataset['trial'].unique():
-			hit_ind = dataset['states'][dataset['trial']==trial].indices()[-1]
+		reward_h = 0.0
+		#hit_ind = dataset['states'][dataset['trial']==trial].index[-1]-40
+		N = len(states)
+		
+		#if N<40:
+			#print("Error very small trajectory smaller than 40, to investigate")
+		hit_ind=N-3	#N-40
+		for k in range(1,N):
 			#MSE on the action chosen by Agent on each state of a trajectory from the behaviour dataset
-			state_cue_front, state_cue_back, state_cue_direction = update_cuepos(state_cue_front, actions.cpu().detach().numpy(), call="evaluation")
-			#if (state_cue_front[0] - state_cueball[0])**2 + (state_cue_front[2] - state_cueball[2])**2 < radius \
-			#and state_cue_front[1] < state_cueball[1] + vertical_margin:
-			if k >= (hit_ind-2) and k <= (hit_ind+2):
-				#next_state_cueball = update_cueballpos(state_cueball, cuevel)
-				#states[k][0:3] = next_state_cueball
-				reward = compute_reward_evaluation(angle, state[9:12], reward)	#cuevel
-			states[k][12:15] = state_cue_front
-			states[k][15:18] = state_cue_back
-			states[k][18:21] = state_cue_direction
+			prev_angle = angle
+			prev_angle_h = angle_h
+			angle_h = action_h[k,0]
+			force_h = action_h[k,1]
+			state_cue_front, state_cue_back, state_cue_direction, angle, force = update_cuepos(state_cue_front*std_states[12:15] + mean_states[12:15], actions, angle, force, call="evaluation")
+			
+			states[k][12:15] = torch.tensor(state_cue_front - mean_states[12:15] / std_states[12:15] , device=device)
+			states[k][15:18] = torch.tensor(state_cue_back - mean_states[15:18] / std_states[15:18] , device=device)
+			states[k][18:21] = torch.tensor(state_cue_direction - mean_states[18:21] / std_states[18:21] , device=device)
 			#states[k][21:] = actions[1:]
 			if agent == "CQL_SAC":
-				actions = policy.select_action(states[k,:], eval=True)
+				actions = policy.select_action(states[k,:], eval=True).cpu().detach().numpy()*std_actions + mean_actions
 			else:
-				actions = policy.select_action(states[k,:])
-			cuevel = actions[1:].cpu().detach().numpy()
-			angle = actions[0].cpu().detach().numpy()
+				actions = policy.select_action(states[k,:]).cpu().detach().numpy()*std_actions + mean_actions
+			next_angle = actions[0]
+			if k < N-1:
+				next_angle_h = action_h[k+1,0]
+
+			if k > (hit_ind-1) and k < (hit_ind+1):
+				losses_2_behaviour_.append(loss_2_behaviour(angle, states[k][18:21].cpu().detach().numpy(), mean_states, std_states, mean_actions, std_actions))
+				reward = compute_reward_evaluation(prev_angle, angle, next_angle, force, corner, reward, mean_actions, std_actions)	#cuevel
+				reward_h = compute_reward_evaluation(prev_angle_h, angle_h, next_angle_h, force_h, corner, reward_h, mean_actions, std_actions)
+				#if reward_h == 1 and reward_human != 1:
+					#print("reward given for ", angle_h, i)
+		
+		'''if reward_human != reward_h:
+			#print(i, reward_human, reward_h, action_h)
+			if reward_human == 1: 
+				print(i, reward_human, reward_h)
+				c1 += 1
+			elif reward_h == 1:
+				print(i, reward_human, reward_h)
+				c2 += 1
+			else:
+				print("error", i)'''
+		rewards_h = np.append(rewards_h, reward_h)
 		rewards = np.append(rewards, reward)
 		rewards_human = np.append(rewards_human, reward_human)
+	
+	#print("count of mismatch: ", c1, c2)
+	avg_rewards_h = np.sum(rewards_h)/len(rewards_h)
 	avg_rewards = np.sum(rewards)/len(rewards)
 	avg_rewards_human = np.sum(rewards_human)/len(rewards_human)
-	print("number of successful trials agent: ", avg_rewards, np.count_nonzero(rewards), rewards)
-	print("number of successful trials human subject: ", avg_rewards_human, np.count_nonzero(rewards_human), rewards_human)
+	avg_losses_2_behaviour = np.sum(losses_2_behaviour_)/len(losses_2_behaviour_)
+	#print("number of successful trials agent: ", avg_rewards, np.count_nonzero(rewards), rewards)
+	#print("number of successful trials human subject: ", avg_rewards_human, np.count_nonzero(rewards_human), rewards_human)
+	return avg_rewards, avg_rewards_human, avg_rewards_h, avg_losses_2_behaviour
 
 			
-def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration=44, action_dim=3, data_folder=""):
+def evaluate_close_to_human_behaviour(dataset, policy, mean_states, std_states, mean_actions, std_actions, agent="TD3_BC", iteration=44, action_dim=2, data_folder=""):
 	#losses = []
 	#avg_loss = 0.0
-
+	l=5
 	## Actions Visualisation
 	epoch_loss_ = []
 	epoch_loss_u_ = []
@@ -1303,27 +1443,32 @@ def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration
 
 
 	angle_b_ = []
-	vel_x_b_ = []
-	vel_z_b_ = []
+	magnitude_b_ = []
+	#vel_x_b_ = []
+	#vel_z_b_ = []
 
 	angle_e_ = []
-	vel_x_e_ = []
-	vel_z_e_ = []
+	magnitude_e_ = []
+	#vel_x_e_ = []
+	#vel_z_e_ = []
 
 	angle_b_u_ = []
-	vel_x_b_u_ = []
-	vel_z_b_u_ = []
+	magnitude_b_u_ = []
+	#vel_x_b_u_ = []
+	#vel_z_b_u_ = []
 
 	angle_e_u_ = []
-	vel_x_e_u_ = []
-	vel_z_e_u_ = []
+	magnitude_e_u_ = []
+	#vel_x_e_u_ = []
+	#vel_z_e_u_ = []
 
 	for i, trial in tqdm(enumerate(dataset['trial'].unique())):
 		loss = torch.zeros([1,], dtype=torch.float64)
 		states, actions, new_states, reward, terminals= get_trajectory(dataset, trial)
-		if len(states) == 140:
+		if len(states) == l:
 			if torch.any(terminals) == True:
-				if reward[terminals] == 1.0:
+
+				if reward[terminals] != 0.0:
 					count_successful_trajectory += 1
 					successful_trajectory = np.append(successful_trajectory, i)
 					## loss
@@ -1332,12 +1477,14 @@ def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration
 					behaviour_actions = np.zeros((states.size(dim=0),action_dim))
 					agent_actions = np.zeros((states.size(dim=0),action_dim))
 					angle_b = np.zeros((states.size(dim=0)))
-					vel_x_b = np.zeros((states.size(dim=0)))
-					vel_z_b = np.zeros((states.size(dim=0)))
+					magnitude_b = np.zeros((states.size(dim=0)))
+					#vel_x_b = np.zeros((states.size(dim=0)))
+					#vel_z_b = np.zeros((states.size(dim=0)))
 
 					angle_e = np.zeros((states.size(dim=0)))
-					vel_x_e = np.zeros((states.size(dim=0)))
-					vel_z_e = np.zeros((states.size(dim=0)))
+					magnitude_e = np.zeros((states.size(dim=0)))
+					#vel_x_e = np.zeros((states.size(dim=0)))
+					#vel_z_e = np.zeros((states.size(dim=0)))
 					## Actions Visualisation
 
 					for k in range(states.size(dim=0)):
@@ -1353,24 +1500,28 @@ def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration
 
 						## Actions Visualisation
 						angle_b[k] = pi_b[0].detach().numpy()
-						vel_x_b[k] = pi_b[1].detach().numpy()
-						vel_z_b[k] = pi_b[2].detach().numpy()#2
+						magnitude_b[k] = pi_b[1].detach().numpy()
+						#vel_x_b[k] = pi_b[1].detach().numpy()
+						#vel_z_b[k] = pi_b[2].detach().numpy()#2
 
 						angle_e[k] = pi_e[0].detach().numpy()
-						vel_x_e[k] = pi_e[1].detach().numpy()
-						vel_z_e[k] = pi_e[2].detach().numpy()#2
+						magnitude_e[k] = pi_b[1].detach().numpy()
+						#vel_x_e[k] = pi_e[1].detach().numpy()
+						#vel_z_e[k] = pi_e[2].detach().numpy()#2
 
 						behaviour_actions[k,:] = pi_b.detach().numpy()#[1]
 						agent_actions[k,:] = pi_e.detach().numpy()#[1]
 
 
 					angle_b_ = np.append(angle_b_, angle_b)
-					vel_x_b_ = np.append(vel_x_b_, vel_x_b)
-					vel_z_b_ = np.append(vel_z_b_, vel_z_b)
+					magnitude_b_ = np.append(magnitude_b_, magnitude_b)
+					#vel_x_b_ = np.append(vel_x_b_, vel_x_b)
+					#vel_z_b_ = np.append(vel_z_b_, vel_z_b)
 
 					angle_e_ = np.append(angle_e_, angle_e)
-					vel_x_e_ = np.append(vel_x_e_, vel_x_e)
-					vel_z_e_ = np.append(vel_z_e_, vel_z_e)
+					magnitude_e_ = np.append(magnitude_e_, magnitude_e)
+					#vel_x_e_ = np.append(vel_x_e_, vel_x_e)
+					#vel_z_e_ = np.append(vel_z_e_, vel_z_e)
 
 					epoch_loss_ = np.append(epoch_loss_ , epoch_loss)
 
@@ -1382,12 +1533,14 @@ def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration
 					epoch_loss_u = np.zeros(states.size(dim=0))
 					## Actions Visualisation
 					angle_b_u = np.zeros((states.size(dim=0)))
-					vel_x_b_u = np.zeros((states.size(dim=0)))
-					vel_z_b_u = np.zeros((states.size(dim=0)))
+					magnitude_b_u = np.zeros((states.size(dim=0)))
+					#vel_x_b_u = np.zeros((states.size(dim=0)))
+					#vel_z_b_u = np.zeros((states.size(dim=0)))
 
 					angle_e_u = np.zeros((states.size(dim=0)))
-					vel_x_e_u = np.zeros((states.size(dim=0)))
-					vel_z_e_u = np.zeros((states.size(dim=0)))
+					magnitude_e_u = np.zeros((states.size(dim=0)))
+					#vel_x_e_u = np.zeros((states.size(dim=0)))
+					#vel_z_e_u = np.zeros((states.size(dim=0)))
 					## Actions Visualisation
 
 					for k in range(states.size(dim=0)):
@@ -1398,47 +1551,63 @@ def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration
 							pi_e_u = policy.select_action(states[k][:])
 						pi_b_u = actions[k][:].cpu()
 						epoch_loss_u[k] = F.mse_loss(pi_e_u, pi_b_u)
-						loss += F.mse_loss(pi_e_u, pi_b_u)
+						#loss += F.mse_loss(pi_e_u, pi_b_u)
 
 						## Actions Visualisation
 						angle_b_u[k] = pi_b_u[0].detach().numpy()
-						vel_x_b_u[k] = pi_b_u[1].detach().numpy()
-						vel_z_b_u[k] = pi_b_u[2].detach().numpy()#2
+						magnitude_b_u[k] = pi_b_u[1].detach().numpy()
+						#vel_x_b_u[k] = pi_b_u[1].detach().numpy()
+						#vel_z_b_u[k] = pi_b_u[2].detach().numpy()#2
 
 						angle_e_u[k] = pi_e_u[0].detach().numpy()
-						vel_x_e_u[k] = pi_e_u[1].detach().numpy()
-						vel_z_e_u[k] = pi_e_u[2].detach().numpy()#2
+						magnitude_e_u[k] = pi_b_u[1].detach().numpy()
+						#vel_x_e_u[k] = pi_e_u[1].detach().numpy()
+						#vel_z_e_u[k] = pi_e_u[2].detach().numpy()#2
 
 
 					angle_b_u_ = np.append(angle_b_u_, angle_b_u)
-					vel_x_b_u_ = np.append(vel_x_b_u_, vel_x_b_u)
-					vel_z_b_u_ = np.append(vel_z_b_u_, vel_z_b_u)
+					magnitude_b_u_ = np.append(magnitude_b_u_, magnitude_b_u)
+					#vel_x_b_u_ = np.append(vel_x_b_u_, vel_x_b_u)
+					#vel_z_b_u_ = np.append(vel_z_b_u_, vel_z_b_u)
 
 					angle_e_u_ = np.append(angle_e_u_, angle_e_u)
-					vel_x_e_u_ = np.append(vel_x_e_u_, vel_x_e_u)
-					vel_z_e_u_ = np.append(vel_z_e_u_, vel_z_e_u)
+					magnitude_e_u_ = np.append(magnitude_e_u_, magnitude_e_u)
+					#vel_x_e_u_ = np.append(vel_x_e_u_, vel_x_e_u)
+					#vel_z_e_u_ = np.append(vel_z_e_u_, vel_z_e_u)
 
 					epoch_loss_u_ = np.append(epoch_loss_u_ , epoch_loss_u)
 			else:
 				print("No terminal state in trial ", trial, terminals)
+		else:
+			print("len state of trial ", trial, " is not ", l)
 		## Actions Visualisation
 
 	X_s = []
 	X_u = []
-	
 	fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
 	mean_b.set_ylabel("Angle")
 	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
+
+	angle_b_ = angle_b_*std_actions[0] + mean_actions[0]
+	angle_e_ = angle_e_*std_actions[0] + mean_actions[0]
+	angle_b_u_ = angle_b_u_*std_actions[0] + mean_actions[0]
+	angle_e_u_ = angle_e_u_*std_actions[0] + mean_actions[0]
 	
+	magnitude_b_ = magnitude_b_*std_actions[1] + mean_actions[1]
+	magnitude_e_ = magnitude_e_*std_actions[1] + mean_actions[1]
+	magnitude_b_u_ = magnitude_b_u_*std_actions[1] + mean_actions[1]
+	magnitude_e_u_ = magnitude_e_u_*std_actions[1] + mean_actions[1]
+
+
 	for i in range(count_successful_trajectory):   
-		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
-		mean_b.plot(X_s, angle_b_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_s, angle_e_[i*140:(i+1)*140], color='green')
+		X_s = np.arange(successful_trajectory[i]*l, (successful_trajectory[i]+1)*l)
+		mean_b.plot(X_s, angle_b_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_s, angle_e_[i*l:(i+1)*l], color='green')
 	for i in range(count_unsuccessful_trajectory):
-		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
-		mean_b.plot(X_u, angle_b_u_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_u, angle_e_u_[i*140:(i+1)*140], color='red')
+		X_u = np.arange(unsuccessful_trajectory[i]*l, (unsuccessful_trajectory[i]+1)*l)
+		mean_b.plot(X_u, angle_b_u_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_u, angle_e_u_[i*l:(i+1)*l], color='red')
 	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_angle_behaviour_agent.png')
 
 	fig, mean_b = plt.subplots()
@@ -1446,39 +1615,39 @@ def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration
 	mean_b.set_ylabel("Velocity x-axis")
 	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
 	for i in range(count_successful_trajectory):   
-		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
-		mean_b.plot(X_s, vel_x_b_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_s, vel_x_e_[i*140:(i+1)*140], color='green')
+		X_s = np.arange(successful_trajectory[i]*l, (successful_trajectory[i]+1)*l)
+		mean_b.plot(X_s,magnitude_b_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_s, magnitude_e_[i*l:(i+1)*l], color='green')
 	for i in range(count_unsuccessful_trajectory):
-		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
-		mean_b.plot(X_u, vel_x_b_u_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_u, vel_x_e_u_[i*140:(i+1)*140], color='red')
-	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_vel_x_behaviour_agent.png')
+		X_u = np.arange(unsuccessful_trajectory[i]*l, (unsuccessful_trajectory[i]+1)*l)
+		mean_b.plot(X_u, magnitude_b_u_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_u, magnitude_e_u_[i*l:(i+1)*l], color='red')
+	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_magnitude_behaviour_agent.png')
 
-	fig, mean_b = plt.subplots()
+	"""fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
 	mean_b.set_ylabel("Velocity z-axis")
 	fig.suptitle('Behaviour and Agent policy', fontsize=16, y=1.04)
 	for i in range(count_successful_trajectory):   
-		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
-		mean_b.plot(X_s, vel_z_b_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_s, vel_z_e_[i*140:(i+1)*140], color='green')
+		X_s = np.arange(successful_trajectory[i]*l, (successful_trajectory[i]+1)*l)
+		mean_b.plot(X_s, vel_z_b_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_s, vel_z_e_[i*l:(i+1)*l], color='green')
 	for i in range(count_unsuccessful_trajectory):
-		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
-		mean_b.plot(X_u, vel_z_b_u_[i*140:(i+1)*140], color='blue')
-		mean_b.plot(X_u, vel_z_e_u_[i*140:(i+1)*140], color='red')
-	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')
+		X_u = np.arange(unsuccessful_trajectory[i]*l, (unsuccessful_trajectory[i]+1)*l)
+		mean_b.plot(X_u, vel_z_b_u_[i*l:(i+1)*l], color='blue')
+		mean_b.plot(X_u, vel_z_e_u_[i*l:(i+1)*l], color='red')
+	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_vel_z_behaviour_agent.png')"""
 
 	fig, mean_b = plt.subplots()
 	mean_b.set_xlabel("timesteps")
 	mean_b.set_ylabel("MSE loss")
 	fig.suptitle('MSE loss between Behaviour and Agent policy', fontsize=16, y=1.04)  
 	for i in range(count_successful_trajectory):   
-		X_s = np.arange(successful_trajectory[i]*140, (successful_trajectory[i]+1)*140)
-		mean_b.plot(X_s, epoch_loss_[i*140:(i+1)*140], color='green')
+		X_s = np.arange(successful_trajectory[i]*l, (successful_trajectory[i]+1)*l)
+		mean_b.plot(X_s, epoch_loss_[i*l:(i+1)*l], color='green')
 	for i in range(count_unsuccessful_trajectory):
-		X_u = np.arange(unsuccessful_trajectory[i]*140, (unsuccessful_trajectory[i]+1)*140)
-		mean_b.plot(X_u, epoch_loss_u_[i*140:(i+1)*140], color='red')
+		X_u = np.arange(unsuccessful_trajectory[i]*l, (unsuccessful_trajectory[i]+1)*l)
+		mean_b.plot(X_u, epoch_loss_u_[i*l:(i+1)*l], color='red')
 	#fig.tight_layout()
 	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_MSE_loss_between_actions.png')
 
@@ -1486,54 +1655,89 @@ def evaluate_close_to_human_behaviour(dataset, policy, agent="TD3_BC", iteration
 	return loss/len(dataset["trial"])
 
 
-def plot_action_animated_learnt_policy(dataset, policy, agent="TD3_BC", iteration=44, data_folder=""):
+def plot_action_animated_learnt_policy(dataset, policy, mean_states, std_states, mean_actions, std_actions, agent="TD3_BC", iteration=44, data_folder=""):
 
-	states,_,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[iteration])
+	states,actions_behaviour,_,_,_ = get_trajectory(dataset, dataset["trial"].iloc[42])	#iteration
 	fig, ax = plt.subplots(1,1)
-	ref_cueposfront = states[:,12:15].cpu().clone().detach()
-	ref_cueposback = states[:,15:18].cpu().clone().detach()
+	ref_cueposfront = states[:,12:15].cpu().clone().detach()*std_states[12:15] + mean_states[12:15]
+	ref_cueposback = states[:,15:18].cpu().clone().detach()*std_states[15:18] + mean_states[15:18]
 	cueposfront = np.zeros((states.shape[0],3))
 	cueposback = np.zeros((states.shape[0],3))
 	cuedirection = np.zeros((states.shape[0],3))
-	cueposfront[0][0] = states[0,12]
-	cueposfront[0][1] = states[0,13]
-	cueposfront[0][2] = states[0,14]
-	cueposback[0][0] = states[0,15]
-	cueposback[0][1] = states[0,16]
-	cueposback[0][2] = states[0,17]
-	cuedirection[0][0] = states[0,18] 
-	cuedirection[0][1] = states[0,19]
-	cuedirection[0][2] = states[0,20]
 
+	cueposfront[0][0:3] = states[0,12:15].cpu()*std_states[12:15] + mean_states[12:15]
+	cueposfront[1][0:3] = states[1,12:15].cpu()*std_states[12:15] + mean_states[12:15]
+	cueposback[0][0:3] = states[0,15:18].cpu()*std_states[15:18] + mean_states[15:18]
+	cueposback[1][0:3] = states[1,15:18].cpu()*std_states[15:18] + mean_states[15:18]
+	cuedirection[1][0:3] = states[1,18:21].cpu()*std_states[18:21] + mean_states[18:21] 
+
+	angle_=[]
+	angle_b=[]
+	force_=[]
+	force_b=[]
+	angle = np.rad2deg(np.arctan2(cuedirection[1][2], cuedirection[1][0]))
+	dt = 0.0111
+	cuevel = (cueposfront[1][:]*std_states[12:15] + mean_states[12:15]-cueposfront[0][:]*std_states[12:15] + mean_states[12:15])/dt
+	force = np.linalg.norm(cuevel) 
+	angle_.append(angle)
+	force_.append(force)
+	angle_b.append(angle)
+	force_b.append(force)
 	if agent == "CQL_SAC":
-		actions = policy.select_action(states[0,:], eval=True)
+		actions = policy.select_action(states[1,:], eval=True)
 	else:
-		actions = policy.select_action(states[0,:])
+		actions = policy.select_action(states[1,:])
 	
 	#vel = [0,0,0]
-	for i in range(states.shape[0]):
-		cueposfront[i][:] , cueposback[i][:], cuedirection[i][:] = update_cuepos(cueposfront[i][:], actions.detach().numpy(), call="plot")		#, vel, vel)
+	for i in range(0, states.shape[0]-1):
+		a = actions.detach().numpy()*std_actions + mean_actions
+		a_b = actions_behaviour[i,:].cpu().detach().numpy()*std_actions+ mean_actions
+		angle_b.append(a_b[0])	#angle +
+		force_b.append(a_b[1])	#force+
+
+		#print(actions, a,cueposfront[i][:] , cueposback[i][:], cuedirection[i][:] )
+		cueposfront[i+1][:] , cueposback[i+1][:], cuedirection[i+1][:], angle, force = update_cuepos(cueposfront[i][:], a, angle, force, call="plot")	#*std_states[12:15] + mean_states[12:15]	#, vel, vel)
+		angle_.append(a[0])	#angle)
+		force_.append(a[1])	#force)
 		#cueposfront[i][:] , cueposback[i][:], vel = update_cuepos(cueposfront[i-1][:],vel, actions)
 		#cueposfront2[i][:] = actions[:3]
 		#cueposback2[i][:] = actions[3:6]
 		#update states
-		states[i,12] = cueposfront[i][0]
-		states[i,13] = cueposfront[i][1]
-		states[i,14] = cueposfront[i][2]
-		states[i,15] = cueposback[i][0]
-		states[i,16] = cueposback[i][1]
-		states[i,17] = cueposback[i][2]
-		states[i,18] = cuedirection[i][0]
-		states[i,19] = cuedirection[i][1]
-		states[i,20] = cuedirection[i][2]
+		states[i+1,12] = cueposfront[i+1][0] #- mean_states[12] / std_states[12] 
+		states[i+1,13] = cueposfront[i+1][1] #- mean_states[13] / std_states[13]
+		states[i+1,14] = cueposfront[i+1][2] #- mean_states[14] / std_states[14]
+		states[i+1,15] = cueposback[i+1][0] #- mean_states[15] / std_states[15]
+		states[i+1,16] = cueposback[i+1][1] #- mean_states[16] / std_states[16]
+		states[i+1,17] = cueposback[i+1][2] #- mean_states[17] / std_states[17]
+		states[i+1,18] = cuedirection[i+1][0] #- mean_states[18] / std_states[18]
+		states[i+1,19] = cuedirection[i+1][1] #- mean_states[19] / std_states[19]
+		states[i+1,20] = cuedirection[i+1][2] #- mean_states[20] / std_states[20]
 		#states[i,21] = actions[1]
 		#states[i,22] = actions[2]
 		#states[i,23] = actions[3]
 		if agent == "CQL_SAC":
-			actions = policy.select_action(states[i,:], eval=True)
+			actions = policy.select_action(states[i+1,:], eval=True)
 		else:
-			actions = policy.select_action(states[i,:])
+			actions = policy.select_action(states[i+1,:])
 
+	
+	fig, ax = plt.subplots()
+	ax.set_xlabel("timesteps")
+	ax.set_ylabel("Angle")
+	fig.suptitle('Angle', fontsize=16, y=1.04)
+	X = np.arange(0, states.shape[0])
+	ax.plot(X, angle_, color='blue')
+	ax.plot(X, angle_b, color='orange')
+	fig.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_angle_animation.png')
+
+	
+	fig2, ax2 = plt.subplots()
+	ax2.set_xlabel("timesteps")
+	ax2.set_ylabel("Force")
+	fig2.suptitle('Force', fontsize=16, y=1.04)
+	ax2.plot(X, force_, color='blue')
+	ax2.plot(X, force_b, color='orange')
+	fig2.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_force_animation.png')
 	#actions = policy.select_action(states).detach().numpy()
 	#cueposfront = actions[:,1:3]
 	#cueposback = actions[:,3:5]
@@ -1542,36 +1746,36 @@ def plot_action_animated_learnt_policy(dataset, policy, agent="TD3_BC", iteratio
 	cueballpos[0][0] = states[0][0]
 	cueballpos[0][1] = states[0][2]
 	
+
 	def animate(i):
 		ax.clear()
 		x_ref = [ref_cueposback[i,0], ref_cueposfront[i,0]]
 		z_ref = [ref_cueposback[i,2], ref_cueposfront[i,2]]
-		ax.plot(x_ref, z_ref, color="green", label = 'reference stick')
-
+		ax.plot(x_ref, z_ref, color="green", label = 'reference stick '+str(round(angle_b[i],3))+"°")
 
 		x_values = [cueposback[i][0], cueposfront[i][0]]
 		z_values = [cueposback[i][2], cueposfront[i][2]]
-		ax.plot(x_values, z_values, color="blue", label = 'cue stick acc')
+		ax.plot(x_values, z_values, color="blue", label = 'Agent cue stick '+str(round(angle_[i],3))+"°")
 
 		
 		"""x_values = [cueposback2[i][0], cueposfront2[i][0]]
 		z_values = [cueposback2[i][2], cueposfront2[i][2]]
 		ax.plot(x_values, z_values, color="orange", label = 'cue stick pos')"""
 
-		x_val = states[i,0]	
-		z_val = states[i,2]
+		x_val = states[i,0]	*std_states[0] + mean_states[0]
+		z_val = states[i,2] *std_states[2] + mean_states[2]
 		ax.scatter(x_val, z_val, s=60, facecolors='black', edgecolors='black', label = 'cueball')
 		
-		ax.scatter(states[i][6], states[i][8], s=60, facecolors='red', edgecolors='red', label = 'target ball')
-		ax.scatter(states[i][9], states[i][11], s=200, facecolors='none', edgecolors='green', label = 'pocket')
+		ax.scatter(states[i][6]*std_states[6] + mean_states[6], states[i][8]*std_states[8] + mean_states[8], s=60, facecolors='red', edgecolors='red', label = 'target ball')
+		ax.scatter(states[i][9]*std_states[9] + mean_states[9], states[i][11]*std_states[11] + mean_states[11], s=200, facecolors='none', edgecolors='green', label = 'pocket')
 		ax.set(xlim=(-1, 1), ylim=(-2, 2))
 		ax.legend()
+		#ax.savefig('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_animation'+str(i)+'.png')
 
 
-	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=40, repeat=False)	
+	anim = animation.FuncAnimation(fig, animate,  frames = len(states), interval=400, repeat=False)	
 	plt.close()
 	anim.save('training_plots/'+agent+data_folder+'/iter_'+str(iteration)+'_Agent_learnt_policy.gif', writer='imagemagick')	
-
 
 ########################## Main  ########################################
 
@@ -1592,40 +1796,10 @@ if __name__ == "__main__":
 			"data"+data_folder+"/TA_Offline_reduced.csv", "data"+data_folder+"/TH_Offline_reduced.csv", "data"+data_folder+"/TS_Offline_reduced.csv",
             "data"+data_folder+"/VB_Offline_reduced.csv", "data"+data_folder+"/WZ_Offline_reduced.csv", "data"+data_folder+"/YC_Offline_reduced.csv",
             "data"+data_folder+"/YH_Offline_reduced.csv"]"""
-	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"]
-	"""["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv", "RL_dataset/Offline_reduced/AS_Offline_reduced.csv", "RL_dataset/Offline_reduced/BL_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/CP_Offline_reduced.csv", "RL_dataset/Offline_reduced/CX_Offline_reduced.csv", 
-			"RL_dataset/Offline_reduced/GS_Offline_reduced.csv", "RL_dataset/Offline_reduced/HZ_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/IK_Offline_reduced.csv", "RL_dataset/Offline_reduced/JW_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/KO_Offline_reduced.csv", "RL_dataset/Offline_reduced/LR_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/MA_Offline_reduced.csv", "RL_dataset/Offline_reduced/MAI_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/MG_Offline_reduced.csv", "RL_dataset/Offline_reduced/MO_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/PM_Offline_reduced.csv", "RL_dataset/Offline_reduced/SC_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/SF_Offline_reduced.csv", "RL_dataset/Offline_reduced/TA_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/TH_Offline_reduced.csv", "RL_dataset/Offline_reduced/TS_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/VB_Offline_reduced.csv", "RL_dataset/Offline_reduced/WZ_Offline_reduced.csv",
-			"RL_dataset/Offline_reduced/YC_Offline_reduced.csv", "RL_dataset/Offline_reduced/YH_Offline_reduced.csv"]"""
-
-	"""["data"+data_folder+"/AAB_Offline_reduced.csv", "data"+data_folder+"/AE_Offline_reduced.csv", "data"+data_folder+"/AK_Offline_reduced.csv",
-            "data"+data_folder+"/AS_Offline_reduced.csv", "data"+data_folder+"/BL_Offline_reduced.csv", "data"+data_folder+"/BR_Offline_reduced.csv",
-            "data"+data_folder+"/BY_Offline_reduced.csv", "data"+data_folder+"/CP_Offline_reduced.csv", "data"+data_folder+"/CX_Offline_reduced.csv",
-            "data"+data_folder+"/DR_Offline_reduced.csv", "data"+data_folder+"/DS_Offline_reduced.csv", "data"+data_folder+"/DZ_Offline_reduced.csv",
-            "data"+data_folder+"/ES_Offline_reduced.csv", "data"+data_folder+"/ESS_Offline_reduced.csv", "data"+data_folder+"/GS_Offline_reduced.csv",
-            "data"+data_folder+"/HL_Offline_reduced.csv", "data"+data_folder+"/HZ_Offline_reduced.csv", "data"+data_folder+"/IK_Offline_reduced.csv",
-            "data"+data_folder+"/JG_Offline_reduced.csv", "data"+data_folder+"/JH_Offline_reduced.csv", "data"+data_folder+"/JR_Offline_reduced.csv",
-            "data"+data_folder+"/JW_Offline_reduced.csv", "data"+data_folder+"/JY_Offline_reduced.csv", "data"+data_folder+"/KO_Offline_reduced.csv",
-            "data"+data_folder+"/LR_Offline_reduced.csv", "data"+data_folder+"/MA_Offline_reduced.csv", "data"+data_folder+"/MAI_Offline_reduced.csv",
-			"data"+data_folder+"/MG_Offline_reduced.csv", "data"+data_folder+"/MO_Offline_reduced.csv", "data"+data_folder+"/PM_Offline_reduced.csv",
-            "data"+data_folder+"/RA_Offline_reduced.csv", "data"+data_folder+"/SC_Offline_reduced.csv", "data"+data_folder+"/SF_Offline_reduced.csv",
-			"data"+data_folder+"/TA_Offline_reduced.csv", "data"+data_folder+"/TH_Offline_reduced.csv", "data"+data_folder+"/TS_Offline_reduced.csv",
-            "data"+data_folder+"/VB_Offline_reduced.csv", "data"+data_folder+"/WZ_Offline_reduced.csv", "data"+data_folder+"/YC_Offline_reduced.csv",
-            "data"+data_folder+"/YH_Offline_reduced.csv"]"""
-
-	#["RL_dataset/Offline_reduced/AAB_Offline_reduced.csv"] 
-
+	
 	#train_set, test_set = load_clean_data(filename)
 	train_set=0
 	test_set=0
-	policy = train(train_set, test_set, state_dim=17, action_dim=6, epochs=100000, batch_size=256, train=True, agent=agent, data_folder=data_folder)	#state_dim=16 #TD3_BC #set train=False to load pretrained model
+	policy = train(train_set, test_set, state_dim=17, action_dim=6, epochs=500000, batch_size=256, train=True, agent=agent, data_folder=data_folder)	#state_dim=16 #TD3_BC #set train=False to load pretrained model
 
 	#evaluate_agent_performance(test_set, policy, agent=agent)
